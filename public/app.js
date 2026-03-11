@@ -110,6 +110,7 @@ function renderSummary(report) {
     ["Validadas SCIE/SSCI", stats.validatedWorksSCIEorSSCI ?? 0],
     ["SCIE", stats.scieCount ?? 0],
     ["SSCI", stats.ssciCount ?? 0],
+    ["Indice no especificado", stats.unspecifiedIndexCount ?? 0],
     ["Tasa validacion", `${stats.validationRate ?? 0}%`],
     ["IF promedio", stats.averageImpactFactor ?? "-"],
     ["IF maximo", stats.maxImpactFactor ?? "-"],
@@ -156,7 +157,7 @@ function renderTable(publications) {
     tr.appendChild(cell(item.title));
     tr.appendChild(cell(item.journal));
     tr.appendChild(cell(item.year || "-"));
-    tr.appendChild(cell((item.editions || []).join(", ")));
+    tr.appendChild(cell((item.editionLabels || item.editions || []).join(", ")));
     tr.appendChild(cell(item.impactFactor ?? "-"));
     tr.appendChild(cell(item.bestQuartile || "-"));
     tr.appendChild(cell(item.bestQuartileArea || "-"));

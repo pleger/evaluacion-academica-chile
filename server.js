@@ -1,6 +1,8 @@
 const express = require("express");
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
+const { execFileSync } = require("child_process");
 const multer = require("multer");
 const XLSX = require("xlsx");
 const { parse: parseCsv } = require("csv-parse/sync");
@@ -15,6 +17,7 @@ const upload = multer({
 const DATA_DIR = path.join(__dirname, "data");
 const CATALOG_PATH = path.join(DATA_DIR, "catalog.json");
 const ORCID_REGEX = /\b\d{4}-\d{4}-\d{4}-\d{3}[\dX]\b/i;
+const VALIDATED_EDITIONS = new Set(["SCIE", "SSCI", "JCR_UNSPECIFIED"]);
 
 let catalog = createEmptyCatalog();
 
@@ -44,16 +47,27 @@ app.post("/api/catalog/upload", upload.single("catalogFile"), async (req, res) =
       return res.status(400).json({ error: "Debes adjuntar un archivo de catalogo JCR/WoS." });
     }
 
-    const tableRows = parseTableFile(req.file);
-    const headerIndex = detectHeaderIndex(tableRows);
-    if (headerIndex < 0) {
-      return res.status(400).json({
-        error: "No se detecto la fila de cabecera del catalogo. Verifica que incluya 'Journal name'."
-      });
+    const extension = path.extname(req.file.originalname || "").toLowerCase();
+    let parsedRows = [];
+    let sourceRows = 0;
+
+    if (extension === ".pdf") {
+      parsedRows = parsePdfCatalogRows(req.file.buffer, req.file.originalname);
+      sourceRows = parsedRows.length;
+    } else {
+      const tableRows = parseTableFile(req.file);
+      const headerIndex = detectHeaderIndex(tableRows);
+      if (headerIndex < 0) {
+        return res.status(400).json({
+          error: "No se detecto la fila de cabecera del catalogo. Verifica que incluya 'Journal name'."
+        });
+      }
+
+      const objects = toObjectsFromHeader(tableRows, headerIndex);
+      parsedRows = objects.map(mapCatalogRow).filter((item) => item !== null);
+      sourceRows = objects.length;
     }
 
-    const objects = toObjectsFromHeader(tableRows, headerIndex);
-    const parsedRows = objects.map(mapCatalogRow).filter((item) => item !== null);
     if (!parsedRows.length) {
       return res.status(400).json({
         error: "No se detectaron filas validas de revistas en el archivo."
@@ -62,7 +76,7 @@ app.post("/api/catalog/upload", upload.single("catalogFile"), async (req, res) =
 
     catalog = buildCatalog(parsedRows, {
       sourceFileName: req.file.originalname,
-      sourceRows: objects.length
+      sourceRows
     });
     persistCatalog(catalog);
 
@@ -222,6 +236,104 @@ function parseDelimitedRows(buffer) {
   }
 
   return best;
+}
+
+function parsePdfCatalogRows(pdfBuffer, originalName) {
+  const tempPath = path.join(
+    os.tmpdir(),
+    `jcr_catalog_${Date.now()}_${Math.random().toString(36).slice(2)}.pdf`
+  );
+
+  let text = "";
+  try {
+    fs.writeFileSync(tempPath, pdfBuffer);
+    text = execFileSync("pdftotext", ["-layout", tempPath, "-"], {
+      encoding: "utf8",
+      maxBuffer: 256 * 1024 * 1024
+    });
+  } catch (_error) {
+    throw new Error("No se pudo leer el PDF. Verifica que pdftotext este disponible y el archivo sea valido.");
+  } finally {
+    try {
+      fs.unlinkSync(tempPath);
+    } catch (_error) {
+      // Ignore temp cleanup errors.
+    }
+  }
+
+  const inferredYear = parseYear(originalName) || parseYear(text.slice(0, 2000));
+  const rows = [];
+
+  for (const line of text.split(/\r?\n/)) {
+    const parsed = parsePdfCatalogLine(line, inferredYear);
+    if (parsed) rows.push(parsed);
+  }
+
+  return dedupePdfRows(rows);
+}
+
+function parsePdfCatalogLine(line, inferredYear) {
+  const raw = String(line || "").replace(/\u00a0/g, " ").trim();
+  if (!raw) return null;
+  if (!/^\d/.test(raw)) return null;
+  if (/^(\d+\s+)?(rank|journal name|publisher|issn|jif|quartile)\b/i.test(raw)) return null;
+
+  const segments = raw
+    .split(/\s{2,}/)
+    .map((value) => value.trim())
+    .filter(Boolean);
+  if (segments.length < 4) return null;
+
+  const quartile = parseQuartile(segments[segments.length - 1]);
+  if (!quartile) return null;
+
+  const impactFactor = parseImpactFactor(segments[segments.length - 2]);
+  if (!Number.isFinite(impactFactor)) return null;
+
+  const issnValue = extractIssn(segments[segments.length - 3]);
+  const left = segments.slice(0, -3);
+  if (!left.length) return null;
+
+  let rankAndTitle = left[0];
+  if (/^\d+$/.test(rankAndTitle)) {
+    if (!left[1]) return null;
+    rankAndTitle = `${rankAndTitle} ${left[1]}`;
+  }
+
+  const match = rankAndTitle.match(/^(\d+)\s+(.+)$/);
+  if (!match) return null;
+
+  const journalName = compactSpaces(match[2]);
+  if (!journalName) return null;
+  if (/^(jcr impact factor list|edited by)\b/i.test(journalName)) return null;
+
+  return {
+    journalName,
+    issn: issnValue,
+    edition: "JCR_UNSPECIFIED",
+    category: "",
+    quartile,
+    impactFactor,
+    jifYear: inferredYear || null
+  };
+}
+
+function dedupePdfRows(rows) {
+  const uniqueMap = new Map();
+
+  for (const row of rows) {
+    const key = [
+      normalizeKey(row.journalName),
+      row.issn || "",
+      row.impactFactor ?? "",
+      row.quartile || "",
+      row.jifYear || ""
+    ].join("::");
+
+    if (!uniqueMap.has(key)) uniqueMap.set(key, row);
+  }
+
+  return [...uniqueMap.values()];
 }
 
 function scoreRowsForCatalog(rows) {
@@ -400,7 +512,7 @@ function buildCatalog(parsedRows, sourceMeta) {
       ...metrics.map((metric) => (Number.isFinite(metric.jifYear) ? metric.jifYear : -Infinity))
     );
 
-    const validated = editions.includes("SCIE") || editions.includes("SSCI");
+    const validated = editions.some((edition) => isValidatedEdition(edition));
 
     return {
       journalName: item.journalName,
@@ -497,8 +609,10 @@ function buildResearchReport(orcid, works, currentCatalog) {
     if (journal) matchedCatalogCount += 1;
     if (!journal || !journal.validatedInJcr) continue;
 
-    const editions = journal.editions.filter((edition) => edition === "SCIE" || edition === "SSCI");
+    const editions = journal.editions.filter((edition) => isValidatedEdition(edition));
     if (!editions.length) continue;
+    const editionLabels = editions.map((edition) => formatEditionLabel(edition));
+    const bestQuartileArea = journal.bestQuartileAreas.join(" | ") || "No disponible en este formato de catalogo";
 
     reportRows.push({
       title: work.title || "Sin titulo",
@@ -507,9 +621,10 @@ function buildResearchReport(orcid, works, currentCatalog) {
       doi: work.doi || null,
       type: work.type || null,
       editions,
+      editionLabels,
       impactFactor: journal.impactFactor,
       bestQuartile: journal.bestQuartile,
-      bestQuartileArea: journal.bestQuartileAreas.join(" | ") || null,
+      bestQuartileArea,
       allQuartiles: uniq(journal.metrics.map((metric) => metric.quartile).filter(Boolean)),
       issn: journal.issn.join(", ")
     });
@@ -517,6 +632,7 @@ function buildResearchReport(orcid, works, currentCatalog) {
 
   const scieCount = reportRows.filter((row) => row.editions.includes("SCIE")).length;
   const ssciCount = reportRows.filter((row) => row.editions.includes("SSCI")).length;
+  const unspecifiedIndexCount = reportRows.filter((row) => row.editions.includes("JCR_UNSPECIFIED")).length;
 
   const quartileDistribution = { Q1: 0, Q2: 0, Q3: 0, Q4: 0, SinDato: 0 };
   reportRows.forEach((row) => {
@@ -552,6 +668,7 @@ function buildResearchReport(orcid, works, currentCatalog) {
       validatedWorksSCIEorSSCI: reportRows.length,
       scieCount,
       ssciCount,
+      unspecifiedIndexCount,
       validationRate: works.length ? Number(((reportRows.length / works.length) * 100).toFixed(2)) : 0,
       averageImpactFactor: ifValues.length ? Number((sum(ifValues) / ifValues.length).toFixed(3)) : null,
       maxImpactFactor: ifValues.length ? Math.max(...ifValues) : null,
@@ -587,7 +704,7 @@ function createCsvReport(report) {
       row.year || "",
       row.doi || "",
       row.type || "",
-      row.editions.join("|"),
+      (row.editionLabels || row.editions).join("|"),
       row.impactFactor ?? "",
       row.bestQuartile || "",
       row.bestQuartileArea || "",
@@ -652,6 +769,18 @@ function chooseBestQuartile(values) {
 function parseYear(value) {
   const match = String(value || "").match(/\b(19|20)\d{2}\b/);
   return match ? Number(match[0]) : null;
+}
+
+function isValidatedEdition(edition) {
+  return VALIDATED_EDITIONS.has(String(edition || "").toUpperCase());
+}
+
+function formatEditionLabel(edition) {
+  const normalized = String(edition || "").toUpperCase();
+  if (normalized === "JCR_UNSPECIFIED") {
+    return "SCIE/SSCI (no especificado en catalogo PDF)";
+  }
+  return normalized;
 }
 
 function normalizeKey(value) {

@@ -1,5 +1,7 @@
 const STORAGE_KEY = "wos_jcr_catalog_v1";
 const ORCID_REGEX = /\b\d{4}-\d{4}-\d{4}-\d{3}[\dX]\b/i;
+const PDFJS_WORKER_URL = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js";
+const VALIDATED_EDITIONS = new Set(["SCIE", "SSCI", "JCR_UNSPECIFIED"]);
 
 const catalogForm = document.getElementById("catalog-form");
 const catalogFileInput = document.getElementById("catalog-file");
@@ -97,24 +99,33 @@ async function onCatalogUpload(event) {
     return;
   }
 
-  if (typeof XLSX === "undefined") {
-    setMessage("No se pudo cargar el parser XLSX en el navegador.", true);
-    return;
-  }
-
   disableDuring(catalogForm, true);
   setMessage("Procesando catalogo...", false);
 
   try {
-    const tableRows = await parseTableFile(file);
-    const headerIndex = detectHeaderIndex(tableRows);
+    const extension = getFileExtension(file.name);
+    let parsedRows = [];
+    let sourceRows = 0;
 
-    if (headerIndex < 0) {
-      throw new Error("No se detecto cabecera valida. Debe incluir Journal name y columnas de indice/cuartil.");
+    if (extension === "pdf") {
+      parsedRows = await parsePdfCatalogRows(file);
+      sourceRows = parsedRows.length;
+    } else {
+      if (typeof XLSX === "undefined") {
+        throw new Error("No se pudo cargar el parser XLSX en el navegador.");
+      }
+
+      const tableRows = await parseTableFile(file);
+      const headerIndex = detectHeaderIndex(tableRows);
+
+      if (headerIndex < 0) {
+        throw new Error("No se detecto cabecera valida. Debe incluir Journal name y columnas de indice/cuartil.");
+      }
+
+      const objects = toObjectsFromHeader(tableRows, headerIndex);
+      parsedRows = objects.map(mapCatalogRow).filter((item) => item !== null);
+      sourceRows = objects.length;
     }
-
-    const objects = toObjectsFromHeader(tableRows, headerIndex);
-    const parsedRows = objects.map(mapCatalogRow).filter((item) => item !== null);
 
     if (!parsedRows.length) {
       throw new Error("No se detectaron filas validas de revistas en el archivo.");
@@ -122,7 +133,7 @@ async function onCatalogUpload(event) {
 
     catalog = buildCatalog(parsedRows, {
       sourceFileName: file.name,
-      sourceRows: objects.length
+      sourceRows
     });
 
     saveCatalogToStorage();
@@ -182,6 +193,7 @@ function renderSummary(report) {
     ["Validadas SCIE/SSCI", stats.validatedWorksSCIEorSSCI ?? 0],
     ["SCIE", stats.scieCount ?? 0],
     ["SSCI", stats.ssciCount ?? 0],
+    ["Indice no especificado", stats.unspecifiedIndexCount ?? 0],
     ["Tasa validacion", `${stats.validationRate ?? 0}%`],
     ["IF promedio", stats.averageImpactFactor ?? "-"],
     ["IF maximo", stats.maxImpactFactor ?? "-"],
@@ -224,7 +236,7 @@ function renderTable(publications) {
     tr.appendChild(cell(item.title));
     tr.appendChild(cell(item.journal));
     tr.appendChild(cell(item.year || "-"));
-    tr.appendChild(cell((item.editions || []).join(", ") || "-"));
+    tr.appendChild(cell((item.editionLabels || item.editions || []).join(", ") || "-"));
     tr.appendChild(cell(item.impactFactor ?? "-"));
     tr.appendChild(cell(item.bestQuartile || "-"));
     tr.appendChild(cell(item.bestQuartileArea || "-"));
@@ -272,7 +284,7 @@ function onDownloadCsv() {
         row.year || "",
         row.doi || "",
         row.type || "",
-        row.editions.join("|"),
+        (row.editionLabels || row.editions || []).join("|"),
         row.impactFactor ?? "",
         row.bestQuartile || "",
         row.bestQuartileArea || "",
@@ -310,7 +322,7 @@ function downloadBlob(content, mimeType, fileName) {
 }
 
 async function parseTableFile(file) {
-  const extension = (file.name.split(".").pop() || "").toLowerCase();
+  const extension = getFileExtension(file.name);
 
   if (extension === "xls" || extension === "xlsx") {
     const buffer = await file.arrayBuffer();
@@ -334,6 +346,10 @@ async function parseTableFile(file) {
 
   const buffer = await file.arrayBuffer();
   return parseSpreadsheetRows(buffer);
+}
+
+function getFileExtension(fileName) {
+  return (String(fileName || "").split(".").pop() || "").toLowerCase();
 }
 
 function parseSpreadsheetRows(buffer) {
@@ -370,6 +386,151 @@ function parseDelimitedRows(text, delimiter) {
   } catch (_error) {
     return [];
   }
+}
+
+async function parsePdfCatalogRows(file) {
+  if (typeof pdfjsLib === "undefined") {
+    throw new Error("No se pudo cargar el parser PDF en el navegador.");
+  }
+
+  pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS_WORKER_URL;
+
+  const inferredYear = parseYear(file.name);
+  const data = new Uint8Array(await file.arrayBuffer());
+  const loadingTask = pdfjsLib.getDocument({ data });
+  const document = await loadingTask.promise;
+  const parsedRows = [];
+
+  for (let pageNumber = 1; pageNumber <= document.numPages; pageNumber += 1) {
+    const page = await document.getPage(pageNumber);
+    const textContent = await page.getTextContent();
+    const lines = buildPdfLines(textContent.items || []);
+
+    lines.forEach((line) => {
+      const row = parsePdfCatalogLine(line, inferredYear);
+      if (row) parsedRows.push(row);
+    });
+  }
+
+  const uniqueRows = dedupePdfRows(parsedRows);
+  if (!uniqueRows.length) {
+    throw new Error("No se detectaron filas validas en el PDF. Verifica que sea el formato JCR Impact Factor List.");
+  }
+  return uniqueRows;
+}
+
+function buildPdfLines(items) {
+  const linesByY = new Map();
+
+  items.forEach((item) => {
+    const text = compactSpaces(item?.str || "");
+    if (!text) return;
+
+    const x = Number(item?.transform?.[4] ?? 0);
+    const y = Number(item?.transform?.[5] ?? 0);
+    const width = Number(item?.width ?? text.length * 4);
+    const yBucket = Math.round(y * 2) / 2;
+
+    if (!linesByY.has(yBucket)) {
+      linesByY.set(yBucket, []);
+    }
+
+    linesByY.get(yBucket).push({ text, x, width });
+  });
+
+  const lines = [];
+  [...linesByY.keys()]
+    .sort((a, b) => b - a)
+    .forEach((key) => {
+      const entries = linesByY.get(key).sort((left, right) => left.x - right.x);
+      let line = "";
+      let previousEnd = null;
+
+      entries.forEach((entry) => {
+        if (previousEnd === null) {
+          line = entry.text;
+          previousEnd = entry.x + entry.width;
+          return;
+        }
+
+        const gap = entry.x - previousEnd;
+        line += gap > 9 ? "   " : " ";
+        line += entry.text;
+        previousEnd = entry.x + entry.width;
+      });
+
+      line = line.trim();
+      if (line) lines.push(line);
+    });
+
+  return lines;
+}
+
+function parsePdfCatalogLine(line, inferredYear) {
+  const raw = String(line || "").replace(/\u00a0/g, " ").trim();
+  if (!raw) return null;
+  if (!/^\d/.test(raw)) return null;
+  if (/^(\d+\s+)?(rank|journal name|publisher|issn|jif|quartile)\b/i.test(raw)) return null;
+
+  const segments = raw
+    .split(/\s{2,}/)
+    .map((value) => value.trim())
+    .filter(Boolean);
+
+  if (segments.length < 4) return null;
+
+  const quartile = parseQuartile(segments[segments.length - 1]);
+  if (!quartile) return null;
+
+  const impactFactor = parseImpactFactor(segments[segments.length - 2]);
+  if (!Number.isFinite(impactFactor)) return null;
+
+  const issnPart = segments[segments.length - 3];
+  const journalPart = segments.slice(0, -3);
+  if (!journalPart.length) return null;
+
+  let rankAndTitle = journalPart[0];
+  if (/^\d+$/.test(rankAndTitle)) {
+    if (!journalPart[1]) return null;
+    rankAndTitle = `${rankAndTitle} ${journalPart[1]}`;
+  }
+
+  const rankMatch = rankAndTitle.match(/^(\d+)\s+(.+)$/);
+  if (!rankMatch) return null;
+
+  const journalName = compactSpaces(rankMatch[2]);
+  if (!journalName) return null;
+  if (/^(jcr impact factor list|edited by)\b/i.test(journalName)) return null;
+
+  return {
+    journalName,
+    issn: extractIssnList(issnPart),
+    edition: "JCR_UNSPECIFIED",
+    category: "",
+    quartile,
+    impactFactor,
+    jifYear: inferredYear || null
+  };
+}
+
+function dedupePdfRows(rows) {
+  const uniqueMap = new Map();
+
+  rows.forEach((row) => {
+    const key = [
+      normalizeKey(row.journalName),
+      row.issn.join("|"),
+      row.impactFactor ?? "",
+      row.quartile || "",
+      row.jifYear || ""
+    ].join("::");
+
+    if (!uniqueMap.has(key)) {
+      uniqueMap.set(key, row);
+    }
+  });
+
+  return [...uniqueMap.values()];
 }
 
 function scoreRowsForCatalog(rows) {
@@ -567,7 +728,7 @@ function buildCatalog(parsedRows, sourceMeta) {
       journalName: item.journalName,
       issn: [...item.issnSet].sort(),
       editions,
-      validatedInJcr: editions.includes("SCIE") || editions.includes("SSCI"),
+      validatedInJcr: editions.some((edition) => isValidatedEdition(edition)),
       impactFactor: impactCandidates.length ? Math.max(...impactCandidates) : null,
       bestQuartile: bestQuartile || null,
       bestQuartileAreas: bestAreas,
@@ -699,10 +860,12 @@ function buildResearchReport(orcid, works, currentCatalog) {
       return;
     }
 
-    const editions = (journal.editions || []).filter((edition) => edition === "SCIE" || edition === "SSCI");
+    const editions = (journal.editions || []).filter((edition) => isValidatedEdition(edition));
     if (!editions.length) {
       return;
     }
+    const editionLabels = editions.map((edition) => formatEditionLabel(edition));
+    const bestQuartileArea = (journal.bestQuartileAreas || []).join(" | ") || "No disponible en este formato de catalogo";
 
     reportRows.push({
       title: work.title || "Sin titulo",
@@ -711,9 +874,10 @@ function buildResearchReport(orcid, works, currentCatalog) {
       doi: work.doi || null,
       type: work.type || null,
       editions,
+      editionLabels,
       impactFactor: journal.impactFactor,
       bestQuartile: journal.bestQuartile,
-      bestQuartileArea: (journal.bestQuartileAreas || []).join(" | ") || null,
+      bestQuartileArea,
       allQuartiles: journal.allQuartiles || [],
       issn: (journal.issn || []).join(", ")
     });
@@ -721,6 +885,7 @@ function buildResearchReport(orcid, works, currentCatalog) {
 
   const scieCount = reportRows.filter((row) => row.editions.includes("SCIE")).length;
   const ssciCount = reportRows.filter((row) => row.editions.includes("SSCI")).length;
+  const unspecifiedIndexCount = reportRows.filter((row) => row.editions.includes("JCR_UNSPECIFIED")).length;
 
   const quartileDistribution = { Q1: 0, Q2: 0, Q3: 0, Q4: 0, SinDato: 0 };
   reportRows.forEach((row) => {
@@ -754,6 +919,7 @@ function buildResearchReport(orcid, works, currentCatalog) {
       validatedWorksSCIEorSSCI: reportRows.length,
       scieCount,
       ssciCount,
+      unspecifiedIndexCount,
       validationRate: works.length ? Number(((reportRows.length / works.length) * 100).toFixed(2)) : 0,
       averageImpactFactor: ifValues.length ? Number((sum(ifValues) / ifValues.length).toFixed(3)) : null,
       maxImpactFactor: ifValues.length ? Math.max(...ifValues) : null,
@@ -824,6 +990,18 @@ function parseQuartile(value) {
 function parseYear(value) {
   const match = String(value || "").match(/\b(19|20)\d{2}\b/);
   return match ? Number(match[0]) : null;
+}
+
+function isValidatedEdition(edition) {
+  return VALIDATED_EDITIONS.has(String(edition || "").toUpperCase());
+}
+
+function formatEditionLabel(edition) {
+  const normalized = String(edition || "").toUpperCase();
+  if (normalized === "JCR_UNSPECIFIED") {
+    return "SCIE/SSCI (no especificado en catalogo PDF)";
+  }
+  return normalized;
 }
 
 function splitEditions(value) {
