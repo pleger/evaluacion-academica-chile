@@ -1,5 +1,10 @@
 const STORAGE_KEY = "wos_jcr_catalog_v2";
 const LEGACY_STORAGE_KEY = "wos_jcr_catalog_v1";
+const STORAGE_META_KEY = "wos_jcr_catalog_meta_v1";
+const CATALOG_DB_NAME = "wos_jcr_catalog_db";
+const CATALOG_DB_VERSION = 1;
+const CATALOG_STORE = "catalog";
+const CATALOG_RECORD_KEY = "active";
 const ORCID_REGEX = /\b\d{4}-\d{4}-\d{4}-\d{3}[\dX]\b/i;
 const PDFJS_WORKER_URL = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js";
 const VALIDATED_EDITIONS = new Set(["SCIE", "SSCI", "JCR_UNSPECIFIED"]);
@@ -32,8 +37,8 @@ downloadJsonButton.addEventListener("click", onDownloadJson);
 
 init();
 
-function init() {
-  loadCatalogFromStorage();
+async function init() {
+  await loadCatalogFromStorage();
   refreshCatalogStatus();
 }
 
@@ -60,17 +65,29 @@ function refreshCatalogStatus() {
   researcherSubmit.disabled = true;
 }
 
-function saveCatalogToStorage() {
+async function saveCatalogToStorage() {
   const serializable = {
     meta: catalog.meta,
     journals: catalog.journals
   };
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(serializable));
+  await idbSaveCatalog(serializable);
+  try {
+    localStorage.setItem(STORAGE_META_KEY, JSON.stringify(serializable.meta || null));
+  } catch (_error) {
+    // Ignore browser storage metadata errors.
+  }
+  localStorage.removeItem(STORAGE_KEY);
   localStorage.removeItem(LEGACY_STORAGE_KEY);
 }
 
-function loadCatalogFromStorage() {
+async function loadCatalogFromStorage() {
   try {
+    const persisted = await idbLoadCatalog();
+    if (persisted && Array.isArray(persisted.journals)) {
+      catalog = buildRuntimeCatalog(persisted.journals, persisted.meta || null);
+      return;
+    }
+
     let raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) {
       raw = localStorage.getItem(LEGACY_STORAGE_KEY);
@@ -84,14 +101,16 @@ function loadCatalogFromStorage() {
     if (isLegacyPdfCatalog) return;
 
     catalog = buildRuntimeCatalog(parsed.journals, parsed.meta || null);
+    await idbSaveCatalog({ meta: parsed.meta || null, journals: parsed.journals });
+    localStorage.removeItem(STORAGE_KEY);
+    localStorage.removeItem(LEGACY_STORAGE_KEY);
   } catch (_error) {
     catalog = createEmptyCatalog();
   }
 }
 
-function onClearCatalog() {
-  localStorage.removeItem(STORAGE_KEY);
-  localStorage.removeItem(LEGACY_STORAGE_KEY);
+async function onClearCatalog() {
+  await clearPersistedCatalog();
   catalog = createEmptyCatalog();
   lastReport = null;
   clearReport();
@@ -145,13 +164,80 @@ async function onCatalogUpload(event) {
       sourceRows
     });
 
-    saveCatalogToStorage();
+    await saveCatalogToStorage();
     refreshCatalogStatus();
     setMessage(`Catalogo cargado correctamente. Revistas: ${catalog.journals.length}.`, false);
   } catch (error) {
     setMessage(error.message || "Error al procesar el catalogo.", true);
   } finally {
     disableDuring(catalogForm, false);
+  }
+}
+
+function openCatalogDb() {
+  return new Promise((resolve, reject) => {
+    if (!("indexedDB" in window)) {
+      reject(new Error("IndexedDB no esta disponible en este navegador."));
+      return;
+    }
+
+    const request = indexedDB.open(CATALOG_DB_NAME, CATALOG_DB_VERSION);
+
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(CATALOG_STORE)) {
+        db.createObjectStore(CATALOG_STORE);
+      }
+    };
+
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error("No se pudo abrir IndexedDB."));
+  });
+}
+
+async function idbSaveCatalog(payload) {
+  const db = await openCatalogDb();
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction(CATALOG_STORE, "readwrite");
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error || new Error("No se pudo guardar el catalogo en IndexedDB."));
+    tx.objectStore(CATALOG_STORE).put(payload, CATALOG_RECORD_KEY);
+  });
+  db.close();
+}
+
+async function idbLoadCatalog() {
+  const db = await openCatalogDb();
+  const value = await new Promise((resolve, reject) => {
+    const tx = db.transaction(CATALOG_STORE, "readonly");
+    tx.onerror = () => reject(tx.error || new Error("No se pudo leer catalogo desde IndexedDB."));
+    const req = tx.objectStore(CATALOG_STORE).get(CATALOG_RECORD_KEY);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error || new Error("No se pudo leer registro de catalogo."));
+  });
+  db.close();
+  return value;
+}
+
+async function idbClearCatalog() {
+  const db = await openCatalogDb();
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction(CATALOG_STORE, "readwrite");
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error || new Error("No se pudo limpiar catalogo en IndexedDB."));
+    tx.objectStore(CATALOG_STORE).delete(CATALOG_RECORD_KEY);
+  });
+  db.close();
+}
+
+async function clearPersistedCatalog() {
+  localStorage.removeItem(STORAGE_KEY);
+  localStorage.removeItem(LEGACY_STORAGE_KEY);
+  localStorage.removeItem(STORAGE_META_KEY);
+  try {
+    await idbClearCatalog();
+  } catch (_error) {
+    // Ignore clean-up failures.
   }
 }
 
