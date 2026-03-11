@@ -23,8 +23,11 @@ const summarySection = document.getElementById("summary-section");
 const summaryGrid = document.getElementById("summary-grid");
 const tableSection = document.getElementById("table-section");
 const resultsBody = document.getElementById("results-body");
+const diagnosticsSection = document.getElementById("diagnostics-section");
+const diagnosticsBody = document.getElementById("diagnostics-body");
 const downloadCsvButton = document.getElementById("download-csv");
 const downloadJsonButton = document.getElementById("download-json");
+const downloadDiagnosticsCsvButton = document.getElementById("download-diagnostics-csv");
 
 let catalog = createEmptyCatalog();
 let lastReport = null;
@@ -34,6 +37,7 @@ clearCatalogButton.addEventListener("click", onClearCatalog);
 researcherForm.addEventListener("submit", onGenerateReport);
 downloadCsvButton.addEventListener("click", onDownloadCsv);
 downloadJsonButton.addEventListener("click", onDownloadJson);
+downloadDiagnosticsCsvButton.addEventListener("click", onDownloadDiagnosticsCsv);
 
 init();
 
@@ -269,6 +273,7 @@ async function onGenerateReport(event) {
     lastReport = report;
     renderSummary(report);
     renderTable(report.publications);
+    renderDiagnostics(report.diagnostics || []);
     setMessage("Reporte generado.", false);
   } catch (error) {
     setMessage(error.message || "No fue posible generar el reporte.", true);
@@ -290,6 +295,8 @@ function renderSummary(report) {
     ["SCIE", stats.scieCount ?? 0],
     ["SSCI", stats.ssciCount ?? 0],
     ["Indice no especificado", stats.unspecifiedIndexCount ?? 0],
+    ["Sin match catalogo", stats.noCatalogMatchCount ?? 0],
+    ["Sin revista/ISSN ORCID", stats.noJournalDataCount ?? 0],
     ["Tasa validacion", `${stats.validationRate ?? 0}%`],
     ["IF promedio", stats.averageImpactFactor ?? "-"],
     ["IF maximo", stats.maxImpactFactor ?? "-"],
@@ -300,6 +307,10 @@ function renderSummary(report) {
     [
       "Top areas",
       (stats.topBestQuartileAreas || []).map((item) => `${item.value} (${item.count})`).join(" | ") || "-"
+    ],
+    [
+      "Top motivo descarte",
+      (stats.diagnosticsByReason || []).map((item) => `${item.value} (${item.count})`).join(" | ") || "-"
     ]
   ];
 
@@ -344,11 +355,45 @@ function renderTable(publications) {
   resultsBody.appendChild(fragment);
 }
 
+function renderDiagnostics(rows) {
+  diagnosticsSection.classList.remove("hidden");
+  diagnosticsBody.innerHTML = "";
+
+  if (!rows.length) {
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.colSpan = 10;
+    td.textContent = "No hay diagnostico disponible.";
+    tr.appendChild(td);
+    diagnosticsBody.appendChild(tr);
+    return;
+  }
+
+  const fragment = document.createDocumentFragment();
+  rows.forEach((item) => {
+    const tr = document.createElement("tr");
+    tr.appendChild(cell(item.statusLabel || "-"));
+    tr.appendChild(cell(item.reasonLabel || "-"));
+    tr.appendChild(cell(item.year || "-"));
+    tr.appendChild(cell(item.title || "-"));
+    tr.appendChild(cell(item.orcidJournal || "-"));
+    tr.appendChild(cell(item.catalogJournal || "-"));
+    tr.appendChild(cell(item.matchBy || "-"));
+    tr.appendChild(cell((item.editionLabels || []).join(", ") || "-"));
+    tr.appendChild(cell((item.orcidIssnCandidates || []).join(", ") || "-"));
+    tr.appendChild(cell(item.doi || "-"));
+    fragment.appendChild(tr);
+  });
+  diagnosticsBody.appendChild(fragment);
+}
+
 function clearReport() {
   summarySection.classList.add("hidden");
   tableSection.classList.add("hidden");
+  diagnosticsSection.classList.add("hidden");
   summaryGrid.innerHTML = "";
   resultsBody.innerHTML = "";
+  diagnosticsBody.innerHTML = "";
   lastReport = null;
 }
 
@@ -403,6 +448,51 @@ function onDownloadJson() {
   const text = JSON.stringify(lastReport, null, 2);
   const fileName = `reporte_orcid_${lastReport.researcher.orcid.replace(/-/g, "")}.json`;
   downloadBlob(text, "application/json", fileName);
+}
+
+function onDownloadDiagnosticsCsv() {
+  if (!lastReport) return;
+
+  const header = [
+    "ORCID",
+    "PutCode",
+    "Estado",
+    "Motivo",
+    "Ano",
+    "Titulo",
+    "RevistaORCID",
+    "RevistaCatalogo",
+    "MatchPor",
+    "Indice",
+    "ISSNORCID",
+    "DOI"
+  ];
+
+  const lines = [header.map(csvEscape).join(",")];
+  (lastReport.diagnostics || []).forEach((row) => {
+    lines.push(
+      [
+        lastReport.researcher?.orcid || "",
+        row.putCode || "",
+        row.statusLabel || "",
+        row.reasonLabel || "",
+        row.year || "",
+        row.title || "",
+        row.orcidJournal || "",
+        row.catalogJournal || "",
+        row.matchBy || "",
+        (row.editionLabels || []).join("|"),
+        (row.orcidIssnCandidates || []).join("|"),
+        row.doi || ""
+      ]
+        .map(csvEscape)
+        .join(",")
+    );
+  });
+
+  const csvContent = `\uFEFF${lines.join("\n")}`;
+  const fileName = `diagnostico_orcid_${lastReport.researcher.orcid.replace(/-/g, "")}.csv`;
+  downloadBlob(csvContent, "text/csv;charset=utf-8", fileName);
 }
 
 function downloadBlob(content, mimeType, fileName) {
@@ -961,44 +1051,78 @@ function extractIssnFromExternalIds(summary) {
 
 function buildResearchReport(orcid, works, currentCatalog) {
   const reportRows = [];
+  const diagnostics = [];
   let matchedCatalogCount = 0;
 
   works.forEach((work) => {
-    const journal = matchJournal(work, currentCatalog);
+    const match = matchJournalDetails(work, currentCatalog);
+    const journal = match.journal;
     if (journal) {
       matchedCatalogCount += 1;
     }
 
-    if (!journal || !journal.validatedInJcr) {
-      return;
-    }
-
-    const editions = (journal.editions || []).filter((edition) => isValidatedEdition(edition));
-    if (!editions.length) {
-      return;
-    }
+    const editions = journal ? (journal.editions || []).filter((edition) => isValidatedEdition(edition)) : [];
     const editionLabels = editions.map((edition) => formatEditionLabel(edition));
-    const bestQuartileArea = (journal.bestQuartileAreas || []).join(" | ") || "No disponible en este formato de catalogo";
 
-    reportRows.push({
+    let status = "EXCLUIDA";
+    let reason = "NO_CATALOG_MATCH";
+    if (!work.journalTitle && !(work.issnCandidates || []).length) {
+      reason = "NO_JOURNAL_DATA";
+    } else if (journal && !journal.validatedInJcr) {
+      reason = "MATCHED_NOT_VALIDATED";
+    } else if (journal && !editions.length) {
+      reason = "MATCHED_NO_ALLOWED_INDEX";
+    } else if (journal && editions.length) {
+      status = "INCLUIDA";
+      reason = "VALIDATED_INCLUDED";
+    }
+
+    diagnostics.push({
+      putCode: work.putCode || "",
+      status,
+      statusLabel: status === "INCLUIDA" ? "Incluida" : "Excluida",
+      reason,
+      reasonLabel: reasonToLabel(reason),
       title: work.title || "Sin titulo",
-      journal: work.journalTitle || journal.journalName,
       year: work.year || null,
       doi: work.doi || null,
-      type: work.type || null,
+      orcidJournal: work.journalTitle || "",
+      orcidIssnCandidates: work.issnCandidates || [],
+      catalogJournal: journal?.journalName || "",
+      matchBy: match.matchByLabel || "",
       editions,
-      editionLabels,
-      impactFactor: journal.impactFactor,
-      bestQuartile: journal.bestQuartile,
-      bestQuartileArea,
-      allQuartiles: journal.allQuartiles || [],
-      issn: (journal.issn || []).join(", ")
+      editionLabels
     });
+
+    if (status === "INCLUIDA") {
+      const bestQuartileArea =
+        (journal.bestQuartileAreas || []).join(" | ") || "No disponible en este formato de catalogo";
+      reportRows.push({
+        title: work.title || "Sin titulo",
+        journal: work.journalTitle || journal.journalName,
+        year: work.year || null,
+        doi: work.doi || null,
+        type: work.type || null,
+        editions,
+        editionLabels,
+        impactFactor: journal.impactFactor,
+        bestQuartile: journal.bestQuartile,
+        bestQuartileArea,
+        allQuartiles: journal.allQuartiles || [],
+        issn: (journal.issn || []).join(", ")
+      });
+    }
   });
 
   const scieCount = reportRows.filter((row) => row.editions.includes("SCIE")).length;
   const ssciCount = reportRows.filter((row) => row.editions.includes("SSCI")).length;
   const unspecifiedIndexCount = reportRows.filter((row) => row.editions.includes("JCR_UNSPECIFIED")).length;
+  const noCatalogMatchCount = diagnostics.filter((row) => row.reason === "NO_CATALOG_MATCH").length;
+  const noJournalDataCount = diagnostics.filter((row) => row.reason === "NO_JOURNAL_DATA").length;
+  const diagnosticsByReason = topCounts(
+    diagnostics.map((row) => row.reasonLabel).filter(Boolean),
+    20
+  );
 
   const quartileDistribution = { Q1: 0, Q2: 0, Q3: 0, Q4: 0, SinDato: 0 };
   reportRows.forEach((row) => {
@@ -1033,57 +1157,110 @@ function buildResearchReport(orcid, works, currentCatalog) {
       scieCount,
       ssciCount,
       unspecifiedIndexCount,
+      noCatalogMatchCount,
+      noJournalDataCount,
+      diagnosticsByReason,
       validationRate: works.length ? Number(((reportRows.length / works.length) * 100).toFixed(2)) : 0,
       averageImpactFactor: ifValues.length ? Number((sum(ifValues) / ifValues.length).toFixed(3)) : null,
       maxImpactFactor: ifValues.length ? Math.max(...ifValues) : null,
       quartileDistribution,
       topBestQuartileAreas: topAreas
     },
-    publications: reportRows
+    publications: reportRows,
+    diagnostics
   };
 }
 
-function matchJournal(work, currentCatalog) {
-  const candidates = [];
-  const seen = new Set();
+function matchJournalDetails(work, currentCatalog) {
+  const candidatesByKey = new Map();
   const workJournalKey = normalizeKey(work.journalTitle);
+
+  const addCandidate = (journal, method) => {
+    if (!journal) return;
+    const key = normalizeKey(journal.journalName);
+    if (!key) return;
+    if (!candidatesByKey.has(key)) {
+      candidatesByKey.set(key, {
+        journal,
+        methods: new Set()
+      });
+    }
+    candidatesByKey.get(key).methods.add(method);
+  };
 
   (work.issnCandidates || []).forEach((issn) => {
     const byIssn = currentCatalog.byIssn.get(issn) || [];
     byIssn.forEach((journal) => {
-      const key = normalizeKey(journal.journalName);
-      if (seen.has(key)) return;
-      seen.add(key);
-      candidates.push(journal);
+      addCandidate(journal, "issn_exact");
     });
   });
 
   if (work.journalTitle) {
     const byName = currentCatalog.byName.get(workJournalKey);
     if (byName) {
-      const key = normalizeKey(byName.journalName);
-      if (!seen.has(key)) {
-        seen.add(key);
-        candidates.push(byName);
-      }
+      addCandidate(byName, "name_exact");
     }
   }
 
-  if (!candidates.length && workJournalKey) {
+  if (!candidatesByKey.size && workJournalKey) {
     const fuzzy = findFuzzyJournalMatches(workJournalKey, currentCatalog);
     fuzzy.forEach((journal) => {
-      const key = normalizeKey(journal.journalName);
-      if (seen.has(key)) return;
-      seen.add(key);
-      candidates.push(journal);
+      addCandidate(journal, "name_fuzzy");
     });
   }
 
+  const candidates = [...candidatesByKey.values()];
   if (!candidates.length) {
-    return null;
+    return {
+      journal: null,
+      matchBy: "",
+      matchByLabel: "",
+      candidateCount: 0
+    };
   }
 
-  return candidates.sort((a, b) => scoreJournalCandidate(b, workJournalKey) - scoreJournalCandidate(a, workJournalKey))[0];
+  const ranked = candidates
+    .map((candidate) => {
+      const bestMethod = getBestMethod(candidate.methods);
+      const methodBonus = bestMethod === "issn_exact" ? 1000 : bestMethod === "name_exact" ? 300 : 0;
+      return {
+        ...candidate,
+        bestMethod,
+        score: scoreJournalCandidate(candidate.journal, workJournalKey) + methodBonus
+      };
+    })
+    .sort((left, right) => right.score - left.score);
+
+  const best = ranked[0];
+  return {
+    journal: best.journal,
+    matchBy: best.bestMethod,
+    matchByLabel: matchByToLabel(best.bestMethod),
+    candidateCount: candidates.length
+  };
+}
+
+function getBestMethod(methodSet) {
+  if (methodSet.has("issn_exact")) return "issn_exact";
+  if (methodSet.has("name_exact")) return "name_exact";
+  if (methodSet.has("name_fuzzy")) return "name_fuzzy";
+  return "";
+}
+
+function matchByToLabel(matchBy) {
+  if (matchBy === "issn_exact") return "ISSN exacto";
+  if (matchBy === "name_exact") return "Nombre exacto";
+  if (matchBy === "name_fuzzy") return "Nombre aproximado";
+  return "";
+}
+
+function reasonToLabel(reason) {
+  if (reason === "VALIDATED_INCLUDED") return "Incluida: validada en catalogo";
+  if (reason === "NO_CATALOG_MATCH") return "Excluida: sin coincidencia en catalogo";
+  if (reason === "NO_JOURNAL_DATA") return "Excluida: ORCID sin revista ni ISSN";
+  if (reason === "MATCHED_NOT_VALIDATED") return "Excluida: revista no validada";
+  if (reason === "MATCHED_NO_ALLOWED_INDEX") return "Excluida: indice no permitido";
+  return reason || "Sin detalle";
 }
 
 function findFuzzyJournalMatches(workJournalKey, currentCatalog) {

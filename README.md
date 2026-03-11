@@ -12,6 +12,7 @@ Aplicacion web para:
    - Todos los cuartiles
 5. Exportar reporte a CSV y JSON.
 6. Mostrar resumen estadistico del investigador.
+7. Mostrar diagnostico por publicacion (incluida/excluida) con motivo de coincidencia.
 
 ## Estructura
 
