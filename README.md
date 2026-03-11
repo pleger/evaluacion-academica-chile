@@ -50,3 +50,4 @@ Abrir `http://localhost:8080`.
 - La validacion JCR se hace contra el catalogo cargado localmente.
 - `ESCI` no cuenta como validacion cuando se filtra SCIE/SSCI.
 - Para PDF tipo `JCR IMPACT FACTOR LIST`, el indice viene como `SCIE/SSCI (no especificado en catalogo PDF)` porque ese formato no incluye separacion explicita SCIE vs SSCI ni area de categoria.
+- Si tenias cargado un PDF con una version anterior del parser, vuelve a cargarlo una vez para regenerar el catalogo local.

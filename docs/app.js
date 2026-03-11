@@ -1,4 +1,5 @@
-const STORAGE_KEY = "wos_jcr_catalog_v1";
+const STORAGE_KEY = "wos_jcr_catalog_v2";
+const LEGACY_STORAGE_KEY = "wos_jcr_catalog_v1";
 const ORCID_REGEX = /\b\d{4}-\d{4}-\d{4}-\d{3}[\dX]\b/i;
 const PDFJS_WORKER_URL = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js";
 const VALIDATED_EDITIONS = new Set(["SCIE", "SSCI", "JCR_UNSPECIFIED"]);
@@ -65,15 +66,22 @@ function saveCatalogToStorage() {
     journals: catalog.journals
   };
   localStorage.setItem(STORAGE_KEY, JSON.stringify(serializable));
+  localStorage.removeItem(LEGACY_STORAGE_KEY);
 }
 
 function loadCatalogFromStorage() {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
+    let raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) {
+      raw = localStorage.getItem(LEGACY_STORAGE_KEY);
+    }
     if (!raw) return;
 
     const parsed = JSON.parse(raw);
     if (!parsed || !Array.isArray(parsed.journals)) return;
+    const sourceFile = String(parsed.meta?.sourceFileName || "").toLowerCase();
+    const isLegacyPdfCatalog = sourceFile.endsWith(".pdf") && Number(parsed.meta?.parserVersion || 0) < 2;
+    if (isLegacyPdfCatalog) return;
 
     catalog = buildRuntimeCatalog(parsed.journals, parsed.meta || null);
   } catch (_error) {
@@ -83,6 +91,7 @@ function loadCatalogFromStorage() {
 
 function onClearCatalog() {
   localStorage.removeItem(STORAGE_KEY);
+  localStorage.removeItem(LEGACY_STORAGE_KEY);
   catalog = createEmptyCatalog();
   lastReport = null;
   clearReport();
@@ -403,13 +412,9 @@ async function parsePdfCatalogRows(file) {
 
   for (let pageNumber = 1; pageNumber <= document.numPages; pageNumber += 1) {
     const page = await document.getPage(pageNumber);
-    const textContent = await page.getTextContent();
-    const lines = buildPdfLines(textContent.items || []);
-
-    lines.forEach((line) => {
-      const row = parsePdfCatalogLine(line, inferredYear);
-      if (row) parsedRows.push(row);
-    });
+    const textContent = await page.getTextContent({ normalizeWhitespace: true });
+    const pageRows = extractPdfRowsFromPage(textContent.items || [], inferredYear);
+    parsedRows.push(...pageRows);
   }
 
   const uniqueRows = dedupePdfRows(parsedRows);
@@ -419,8 +424,8 @@ async function parsePdfCatalogRows(file) {
   return uniqueRows;
 }
 
-function buildPdfLines(items) {
-  const linesByY = new Map();
+function extractPdfRowsFromPage(items, inferredYear) {
+  const byY = new Map();
 
   items.forEach((item) => {
     const text = compactSpaces(item?.str || "");
@@ -428,83 +433,87 @@ function buildPdfLines(items) {
 
     const x = Number(item?.transform?.[4] ?? 0);
     const y = Number(item?.transform?.[5] ?? 0);
-    const width = Number(item?.width ?? text.length * 4);
     const yBucket = Math.round(y * 2) / 2;
 
-    if (!linesByY.has(yBucket)) {
-      linesByY.set(yBucket, []);
+    if (!byY.has(yBucket)) {
+      byY.set(yBucket, []);
     }
 
-    linesByY.get(yBucket).push({ text, x, width });
+    byY.get(yBucket).push({ text, x });
   });
 
-  const lines = [];
-  [...linesByY.keys()]
+  const rows = [];
+  [...byY.keys()]
     .sort((a, b) => b - a)
-    .forEach((key) => {
-      const entries = linesByY.get(key).sort((left, right) => left.x - right.x);
-      let line = "";
-      let previousEnd = null;
+    .forEach((yBucket) => {
+      const entries = byY.get(yBucket).sort((left, right) => left.x - right.x);
+      const columns = {
+        rank: [],
+        journal: [],
+        issn: [],
+        jif: [],
+        quartile: []
+      };
 
       entries.forEach((entry) => {
-        if (previousEnd === null) {
-          line = entry.text;
-          previousEnd = entry.x + entry.width;
+        if (entry.x < 85) {
+          columns.rank.push(entry.text);
           return;
         }
-
-        const gap = entry.x - previousEnd;
-        line += gap > 9 ? "   " : " ";
-        line += entry.text;
-        previousEnd = entry.x + entry.width;
+        if (entry.x < 350) {
+          columns.journal.push(entry.text);
+          return;
+        }
+        if (entry.x < 420) {
+          columns.issn.push(entry.text);
+          return;
+        }
+        if (entry.x < 468) {
+          columns.jif.push(entry.text);
+          return;
+        }
+        columns.quartile.push(entry.text);
       });
 
-      line = line.trim();
-      if (line) lines.push(line);
+      const row = parsePdfColumns(columns, inferredYear);
+      if (row) rows.push(row);
     });
 
-  return lines;
+  return rows;
 }
 
-function parsePdfCatalogLine(line, inferredYear) {
-  const raw = String(line || "").replace(/\u00a0/g, " ").trim();
-  if (!raw) return null;
-  if (!/^\d/.test(raw)) return null;
-  if (/^(\d+\s+)?(rank|journal name|publisher|issn|jif|quartile)\b/i.test(raw)) return null;
-
-  const segments = raw
-    .split(/\s{2,}/)
-    .map((value) => value.trim())
-    .filter(Boolean);
-
-  if (segments.length < 4) return null;
-
-  const quartile = parseQuartile(segments[segments.length - 1]);
+function parsePdfColumns(columns, inferredYear) {
+  const quartile = parseQuartile(columns.quartile.join(" "));
   if (!quartile) return null;
 
-  const impactFactor = parseImpactFactor(segments[segments.length - 2]);
+  const impactFactor = parseImpactFactor(columns.jif.join(" "));
   if (!Number.isFinite(impactFactor)) return null;
 
-  const issnPart = segments[segments.length - 3];
-  const journalPart = segments.slice(0, -3);
-  if (!journalPart.length) return null;
+  const rankText = compactSpaces(columns.rank.join(" "));
+  const journalText = compactSpaces(columns.journal.join(" "));
+  let rankAndTitle = compactSpaces(`${rankText} ${journalText}`);
+  if (!rankAndTitle) return null;
 
-  let rankAndTitle = journalPart[0];
-  if (/^\d+$/.test(rankAndTitle)) {
-    if (!journalPart[1]) return null;
-    rankAndTitle = `${rankAndTitle} ${journalPart[1]}`;
+  const fromHeader = normalizeKey(rankAndTitle);
+  if (fromHeader.includes("journal name") || fromHeader.includes("jcr impact factor list") || fromHeader === "rank") {
+    return null;
   }
 
-  const rankMatch = rankAndTitle.match(/^(\d+)\s+(.+)$/);
-  if (!rankMatch) return null;
+  let journalName = "";
+  const withRank = rankAndTitle.match(/^(\d+)\s+(.+)$/);
+  if (withRank) {
+    journalName = compactSpaces(withRank[2]);
+  } else {
+    const fallback = journalText.match(/^(\d+)\s+(.+)$/);
+    journalName = fallback ? compactSpaces(fallback[2]) : journalText;
+  }
 
-  const journalName = compactSpaces(rankMatch[2]);
   if (!journalName) return null;
   if (/^(jcr impact factor list|edited by)\b/i.test(journalName)) return null;
 
   return {
     journalName,
-    issn: extractIssnList(issnPart),
+    issn: extractIssnList(columns.issn.join(" ")),
     edition: "JCR_UNSPECIFIED",
     category: "",
     quartile,
@@ -745,6 +754,7 @@ function buildCatalog(parsedRows, sourceMeta) {
     sourceRows: sourceMeta.sourceRows,
     parsedRows: parsedRows.length,
     journalCount: journals.length,
+    parserVersion: 2,
     uploadedAt: new Date().toISOString()
   });
 
