@@ -48,7 +48,8 @@ function createEmptyCatalog() {
     meta: null,
     journals: [],
     byName: new Map(),
-    byIssn: new Map()
+    byIssn: new Map(),
+    nameEntries: []
   };
 }
 
@@ -546,7 +547,7 @@ function extractPdfRowsFromPage(items, inferredYear) {
           columns.rank.push(entry.text);
           return;
         }
-        if (entry.x < 350) {
+        if (entry.x < 262) {
           columns.journal.push(entry.text);
           return;
         }
@@ -576,11 +577,13 @@ function parsePdfColumns(columns, inferredYear) {
   if (!Number.isFinite(impactFactor)) return null;
 
   const rankText = compactSpaces(columns.rank.join(" "));
-  const journalText = compactSpaces(columns.journal.join(" "));
-  let rankAndTitle = compactSpaces(`${rankText} ${journalText}`);
-  if (!rankAndTitle) return null;
+  let journalText = compactSpaces(columns.journal.join(" "));
+  if (!journalText) return null;
 
-  const fromHeader = normalizeKey(rankAndTitle);
+  let rankAndTitle = compactSpaces(`${rankText} ${journalText}`);
+  if (!rankAndTitle) rankAndTitle = journalText;
+
+  const fromHeader = normalizeKey(journalText);
   if (fromHeader.includes("journal name") || fromHeader.includes("jcr impact factor list") || fromHeader === "rank") {
     return null;
   }
@@ -595,6 +598,8 @@ function parsePdfColumns(columns, inferredYear) {
   }
 
   if (!journalName) return null;
+  journalName = cleanPdfJournalName(journalName);
+  if (!journalName) return null;
   if (/^(jcr impact factor list|edited by)\b/i.test(journalName)) return null;
 
   return {
@@ -606,6 +611,14 @@ function parsePdfColumns(columns, inferredYear) {
     impactFactor,
     jifYear: inferredYear || null
   };
+}
+
+function cleanPdfJournalName(value) {
+  let out = compactSpaces(value);
+  out = out.replace(/^\d+\s+/, "");
+  out = out.replace(/\s+(Q[1-4])$/, "");
+  out = out.replace(/\s+\d+(\.\d+)?$/, "");
+  return compactSpaces(out);
 }
 
 function dedupePdfRows(rows) {
@@ -850,9 +863,12 @@ function buildCatalog(parsedRows, sourceMeta) {
 function buildRuntimeCatalog(journals, meta) {
   const byName = new Map();
   const byIssn = new Map();
+  const nameEntries = [];
 
   journals.forEach((journal) => {
-    byName.set(normalizeKey(journal.journalName), journal);
+    const key = normalizeKey(journal.journalName);
+    byName.set(key, journal);
+    nameEntries.push({ key, journal });
 
     (journal.issn || []).forEach((issn) => {
       if (!byIssn.has(issn)) {
@@ -867,7 +883,8 @@ function buildRuntimeCatalog(journals, meta) {
     meta,
     journals,
     byName,
-    byIssn
+    byIssn,
+    nameEntries
   };
 }
 
@@ -1029,6 +1046,7 @@ function buildResearchReport(orcid, works, currentCatalog) {
 function matchJournal(work, currentCatalog) {
   const candidates = [];
   const seen = new Set();
+  const workJournalKey = normalizeKey(work.journalTitle);
 
   (work.issnCandidates || []).forEach((issn) => {
     const byIssn = currentCatalog.byIssn.get(issn) || [];
@@ -1041,7 +1059,7 @@ function matchJournal(work, currentCatalog) {
   });
 
   if (work.journalTitle) {
-    const byName = currentCatalog.byName.get(normalizeKey(work.journalTitle));
+    const byName = currentCatalog.byName.get(workJournalKey);
     if (byName) {
       const key = normalizeKey(byName.journalName);
       if (!seen.has(key)) {
@@ -1051,18 +1069,43 @@ function matchJournal(work, currentCatalog) {
     }
   }
 
+  if (!candidates.length && workJournalKey) {
+    const fuzzy = findFuzzyJournalMatches(workJournalKey, currentCatalog);
+    fuzzy.forEach((journal) => {
+      const key = normalizeKey(journal.journalName);
+      if (seen.has(key)) return;
+      seen.add(key);
+      candidates.push(journal);
+    });
+  }
+
   if (!candidates.length) {
     return null;
   }
 
-  return candidates.sort((a, b) => scoreJournalCandidate(b) - scoreJournalCandidate(a))[0];
+  return candidates.sort((a, b) => scoreJournalCandidate(b, workJournalKey) - scoreJournalCandidate(a, workJournalKey))[0];
 }
 
-function scoreJournalCandidate(journal) {
+function findFuzzyJournalMatches(workJournalKey, currentCatalog) {
+  const out = [];
+  (currentCatalog.nameEntries || []).forEach((entry) => {
+    if (!entry?.key || !entry?.journal) return;
+    if (entry.key.includes(workJournalKey) || workJournalKey.includes(entry.key)) {
+      out.push(entry.journal);
+    }
+  });
+  return out.slice(0, 40);
+}
+
+function scoreJournalCandidate(journal, workJournalKey = "") {
+  const journalKey = normalizeKey(journal.journalName);
   const validated = journal.validatedInJcr ? 100000 : 0;
   const qScore = quartileScore(journal.bestQuartile);
   const ifScore = Number.isFinite(Number(journal.impactFactor)) ? Number(journal.impactFactor) : 0;
-  return validated + qScore * 100 + ifScore;
+  const containsScore =
+    workJournalKey && (journalKey.includes(workJournalKey) || workJournalKey.includes(journalKey)) ? 500 : 0;
+  const distancePenalty = workJournalKey ? Math.abs(journalKey.length - workJournalKey.length) * 0.2 : 0;
+  return validated + qScore * 100 + ifScore + containsScore - distancePenalty;
 }
 
 function quartileScore(quartile) {
