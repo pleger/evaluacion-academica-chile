@@ -1,0 +1,923 @@
+const STORAGE_KEY = "wos_jcr_catalog_v1";
+const ORCID_REGEX = /\b\d{4}-\d{4}-\d{4}-\d{3}[\dX]\b/i;
+
+const catalogForm = document.getElementById("catalog-form");
+const catalogFileInput = document.getElementById("catalog-file");
+const catalogStatus = document.getElementById("catalog-status");
+const clearCatalogButton = document.getElementById("clear-catalog");
+
+const researcherForm = document.getElementById("researcher-form");
+const orcidInput = document.getElementById("orcid-input");
+const researcherSubmit = document.getElementById("researcher-submit");
+const message = document.getElementById("message");
+
+const summarySection = document.getElementById("summary-section");
+const summaryGrid = document.getElementById("summary-grid");
+const tableSection = document.getElementById("table-section");
+const resultsBody = document.getElementById("results-body");
+const downloadCsvButton = document.getElementById("download-csv");
+const downloadJsonButton = document.getElementById("download-json");
+
+let catalog = createEmptyCatalog();
+let lastReport = null;
+
+catalogForm.addEventListener("submit", onCatalogUpload);
+clearCatalogButton.addEventListener("click", onClearCatalog);
+researcherForm.addEventListener("submit", onGenerateReport);
+downloadCsvButton.addEventListener("click", onDownloadCsv);
+downloadJsonButton.addEventListener("click", onDownloadJson);
+
+init();
+
+function init() {
+  loadCatalogFromStorage();
+  refreshCatalogStatus();
+}
+
+function createEmptyCatalog() {
+  return {
+    loaded: false,
+    meta: null,
+    journals: [],
+    byName: new Map(),
+    byIssn: new Map()
+  };
+}
+
+function refreshCatalogStatus() {
+  if (catalog.loaded) {
+    const uploadedAt = catalog.meta?.uploadedAt ? new Date(catalog.meta.uploadedAt).toLocaleString() : "-";
+    const fileName = catalog.meta?.sourceFileName || "-";
+    catalogStatus.textContent = `Catalogo cargado localmente: SI | Revistas: ${catalog.journals.length} | Archivo: ${fileName} | Fecha: ${uploadedAt}`;
+    researcherSubmit.disabled = false;
+    return;
+  }
+
+  catalogStatus.textContent = "Catalogo cargado localmente: NO. Carga una vez tu archivo JCR/WoS.";
+  researcherSubmit.disabled = true;
+}
+
+function saveCatalogToStorage() {
+  const serializable = {
+    meta: catalog.meta,
+    journals: catalog.journals
+  };
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(serializable));
+}
+
+function loadCatalogFromStorage() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return;
+
+    const parsed = JSON.parse(raw);
+    if (!parsed || !Array.isArray(parsed.journals)) return;
+
+    catalog = buildRuntimeCatalog(parsed.journals, parsed.meta || null);
+  } catch (_error) {
+    catalog = createEmptyCatalog();
+  }
+}
+
+function onClearCatalog() {
+  localStorage.removeItem(STORAGE_KEY);
+  catalog = createEmptyCatalog();
+  lastReport = null;
+  clearReport();
+  refreshCatalogStatus();
+  setMessage("Catalogo local eliminado.", false);
+}
+
+async function onCatalogUpload(event) {
+  event.preventDefault();
+  const file = catalogFileInput.files?.[0];
+
+  if (!file) {
+    setMessage("Selecciona un archivo de catalogo.", true);
+    return;
+  }
+
+  if (typeof XLSX === "undefined") {
+    setMessage("No se pudo cargar el parser XLSX en el navegador.", true);
+    return;
+  }
+
+  disableDuring(catalogForm, true);
+  setMessage("Procesando catalogo...", false);
+
+  try {
+    const tableRows = await parseTableFile(file);
+    const headerIndex = detectHeaderIndex(tableRows);
+
+    if (headerIndex < 0) {
+      throw new Error("No se detecto cabecera valida. Debe incluir Journal name y columnas de indice/cuartil.");
+    }
+
+    const objects = toObjectsFromHeader(tableRows, headerIndex);
+    const parsedRows = objects.map(mapCatalogRow).filter((item) => item !== null);
+
+    if (!parsedRows.length) {
+      throw new Error("No se detectaron filas validas de revistas en el archivo.");
+    }
+
+    catalog = buildCatalog(parsedRows, {
+      sourceFileName: file.name,
+      sourceRows: objects.length
+    });
+
+    saveCatalogToStorage();
+    refreshCatalogStatus();
+    setMessage(`Catalogo cargado correctamente. Revistas: ${catalog.journals.length}.`, false);
+  } catch (error) {
+    setMessage(error.message || "Error al procesar el catalogo.", true);
+  } finally {
+    disableDuring(catalogForm, false);
+  }
+}
+
+async function onGenerateReport(event) {
+  event.preventDefault();
+
+  if (!catalog.loaded) {
+    setMessage("Debes cargar primero un catalogo JCR/WoS.", true);
+    return;
+  }
+
+  const rawOrcid = String(orcidInput.value || "").trim();
+  const orcid = normalizeOrcid(rawOrcid);
+
+  if (!orcid) {
+    setMessage("ORCID invalido. Usa 0000-0000-0000-0000 o URL ORCID.", true);
+    return;
+  }
+
+  disableDuring(researcherForm, true);
+  clearReport();
+  setMessage("Consultando ORCID y validando publicaciones...", false);
+
+  try {
+    const works = await fetchOrcidWorks(orcid);
+    const report = buildResearchReport(orcid, works, catalog);
+
+    lastReport = report;
+    renderSummary(report);
+    renderTable(report.publications);
+    setMessage("Reporte generado.", false);
+  } catch (error) {
+    setMessage(error.message || "No fue posible generar el reporte.", true);
+  } finally {
+    disableDuring(researcherForm, false);
+  }
+}
+
+function renderSummary(report) {
+  summarySection.classList.remove("hidden");
+
+  const stats = report.stats || {};
+  const cards = [
+    ["ORCID", report.researcher?.orcid || "-"],
+    ["Total publicaciones ORCID", stats.totalOrcidWorks ?? 0],
+    ["Con revista informada", stats.worksWithJournalTitle ?? 0],
+    ["Coinciden con catalogo", stats.worksMatchedInCatalog ?? 0],
+    ["Validadas SCIE/SSCI", stats.validatedWorksSCIEorSSCI ?? 0],
+    ["SCIE", stats.scieCount ?? 0],
+    ["SSCI", stats.ssciCount ?? 0],
+    ["Tasa validacion", `${stats.validationRate ?? 0}%`],
+    ["IF promedio", stats.averageImpactFactor ?? "-"],
+    ["IF maximo", stats.maxImpactFactor ?? "-"],
+    [
+      "Distribucion cuartiles",
+      `Q1:${stats.quartileDistribution?.Q1 ?? 0} Q2:${stats.quartileDistribution?.Q2 ?? 0} Q3:${stats.quartileDistribution?.Q3 ?? 0} Q4:${stats.quartileDistribution?.Q4 ?? 0} SinDato:${stats.quartileDistribution?.SinDato ?? 0}`
+    ],
+    [
+      "Top areas",
+      (stats.topBestQuartileAreas || []).map((item) => `${item.value} (${item.count})`).join(" | ") || "-"
+    ]
+  ];
+
+  summaryGrid.innerHTML = "";
+  cards.forEach(([label, value]) => {
+    const card = document.createElement("div");
+    card.className = "stat-card";
+    card.innerHTML = `<small>${escapeHtml(label)}</small><strong>${escapeHtml(String(value))}</strong>`;
+    summaryGrid.appendChild(card);
+  });
+}
+
+function renderTable(publications) {
+  tableSection.classList.remove("hidden");
+  resultsBody.innerHTML = "";
+
+  if (!publications.length) {
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.colSpan = 10;
+    td.textContent = "No se encontraron publicaciones validadas en SCIE/SSCI.";
+    tr.appendChild(td);
+    resultsBody.appendChild(tr);
+    return;
+  }
+
+  const fragment = document.createDocumentFragment();
+  publications.forEach((item) => {
+    const tr = document.createElement("tr");
+    tr.appendChild(cell(item.title));
+    tr.appendChild(cell(item.journal));
+    tr.appendChild(cell(item.year || "-"));
+    tr.appendChild(cell((item.editions || []).join(", ") || "-"));
+    tr.appendChild(cell(item.impactFactor ?? "-"));
+    tr.appendChild(cell(item.bestQuartile || "-"));
+    tr.appendChild(cell(item.bestQuartileArea || "-"));
+    tr.appendChild(cell((item.allQuartiles || []).join(", ") || "-"));
+    tr.appendChild(cell(item.issn || "-"));
+    tr.appendChild(cell(item.doi || "-"));
+    fragment.appendChild(tr);
+  });
+  resultsBody.appendChild(fragment);
+}
+
+function clearReport() {
+  summarySection.classList.add("hidden");
+  tableSection.classList.add("hidden");
+  summaryGrid.innerHTML = "";
+  resultsBody.innerHTML = "";
+  lastReport = null;
+}
+
+function onDownloadCsv() {
+  if (!lastReport) return;
+
+  const header = [
+    "ORCID",
+    "Titulo",
+    "Revista",
+    "Ano",
+    "DOI",
+    "Tipo",
+    "Indice",
+    "ImpactFactor",
+    "MejorQuartil",
+    "AreaMejorQuartil",
+    "TodosQuartiles",
+    "ISSN"
+  ];
+
+  const lines = [header.map(csvEscape).join(",")];
+  lastReport.publications.forEach((row) => {
+    lines.push(
+      [
+        lastReport.researcher.orcid,
+        row.title,
+        row.journal,
+        row.year || "",
+        row.doi || "",
+        row.type || "",
+        row.editions.join("|"),
+        row.impactFactor ?? "",
+        row.bestQuartile || "",
+        row.bestQuartileArea || "",
+        row.allQuartiles.join("|"),
+        row.issn || ""
+      ]
+        .map(csvEscape)
+        .join(",")
+    );
+  });
+
+  const csvContent = `\uFEFF${lines.join("\n")}`;
+  const fileName = `reporte_orcid_${lastReport.researcher.orcid.replace(/-/g, "")}.csv`;
+  downloadBlob(csvContent, "text/csv;charset=utf-8", fileName);
+}
+
+function onDownloadJson() {
+  if (!lastReport) return;
+
+  const text = JSON.stringify(lastReport, null, 2);
+  const fileName = `reporte_orcid_${lastReport.researcher.orcid.replace(/-/g, "")}.json`;
+  downloadBlob(text, "application/json", fileName);
+}
+
+function downloadBlob(content, mimeType, fileName) {
+  const blob = new Blob([content], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = fileName;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(url);
+}
+
+async function parseTableFile(file) {
+  const extension = (file.name.split(".").pop() || "").toLowerCase();
+
+  if (extension === "xls" || extension === "xlsx") {
+    const buffer = await file.arrayBuffer();
+    return parseSpreadsheetRows(buffer);
+  }
+
+  const text = (await file.text()).replace(/^\uFEFF/, "");
+  const delimiters = [",", ";", "\t", "|"];
+  let bestRows = [];
+
+  for (const delimiter of delimiters) {
+    const rows = parseDelimitedRows(text, delimiter);
+    if (scoreRowsForCatalog(rows) > scoreRowsForCatalog(bestRows)) {
+      bestRows = rows;
+    }
+  }
+
+  if (bestRows.length) {
+    return bestRows;
+  }
+
+  const buffer = await file.arrayBuffer();
+  return parseSpreadsheetRows(buffer);
+}
+
+function parseSpreadsheetRows(buffer) {
+  const workbook = XLSX.read(buffer, { type: "array", dense: true, raw: false });
+  const sheetName = workbook.SheetNames?.[0];
+  if (!sheetName) return [];
+
+  const sheet = workbook.Sheets[sheetName];
+  return XLSX.utils.sheet_to_json(sheet, {
+    header: 1,
+    defval: "",
+    raw: false
+  });
+}
+
+function parseDelimitedRows(text, delimiter) {
+  try {
+    const workbook = XLSX.read(text, {
+      type: "string",
+      FS: delimiter,
+      dense: true,
+      raw: false
+    });
+
+    const sheetName = workbook.SheetNames?.[0];
+    if (!sheetName) return [];
+
+    const sheet = workbook.Sheets[sheetName];
+    return XLSX.utils.sheet_to_json(sheet, {
+      header: 1,
+      defval: "",
+      raw: false
+    });
+  } catch (_error) {
+    return [];
+  }
+}
+
+function scoreRowsForCatalog(rows) {
+  if (!Array.isArray(rows) || !rows.length) return 0;
+  let maxCols = 0;
+  rows.forEach((row) => {
+    if (Array.isArray(row)) {
+      maxCols = Math.max(maxCols, row.length);
+    }
+  });
+  return rows.length * maxCols;
+}
+
+function detectHeaderIndex(rows) {
+  for (let i = 0; i < rows.length; i += 1) {
+    const row = rows[i];
+    if (!Array.isArray(row)) continue;
+
+    const normalized = row.map((cell) => normalizeKey(cell));
+    const hasJournalName = normalized.some((cell) => cell === "journal name" || cell === "full journal title");
+    const hasEdition = normalized.some((cell) => cell === "edition" || cell.includes("index"));
+    const hasQuartile = normalized.some((cell) => cell.includes("quartile"));
+
+    if (hasJournalName && (hasEdition || hasQuartile)) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+function toObjectsFromHeader(rows, headerIndex) {
+  const headers = (rows[headerIndex] || []).map((value, index) => {
+    const text = String(value || "").trim();
+    return text || `column_${index + 1}`;
+  });
+
+  const objects = [];
+  for (let i = headerIndex + 1; i < rows.length; i += 1) {
+    const row = rows[i];
+    if (!Array.isArray(row)) continue;
+
+    const joined = row.map((cell) => String(cell || "").trim()).join("");
+    if (!joined) continue;
+
+    const obj = {};
+    headers.forEach((header, idx) => {
+      obj[header] = String(row[idx] || "").trim();
+    });
+    objects.push(obj);
+  }
+  return objects;
+}
+
+function mapCatalogRow(row) {
+  const normalized = normalizeRow(row);
+
+  const journalName = pickValue(normalized, [
+    /^journal name$/,
+    /^full journal title$/,
+    /^source title$/,
+    /^journal title$/,
+    /^source$/,
+    /^so$/
+  ]);
+
+  if (!journalName) {
+    return null;
+  }
+
+  const edition = pickValue(normalized, [/^edition$/, /^web of science index$/, /^wos index$/, /^index$/]);
+  const category = pickValue(normalized, [/^category$/, /^subject category$/, /^jcr category$/]);
+  const quartile = pickValue(normalized, [/^jif quartile$/, /^quartile$/, /^journal quartile$/]).toUpperCase();
+
+  const issnRaw = [
+    pickValue(normalized, [/^issn$/, /^print issn$/, /^sn$/]),
+    pickValue(normalized, [/^eissn$/, /^electronic issn$/, /^e issn$/]),
+    pickValue(normalized, [/^issn\/eissn$/, /^issn eissn$/])
+  ]
+    .filter(Boolean)
+    .join(" ");
+
+  const jifField = pickJifField(normalized);
+  const impactFactor = parseImpactFactor(jifField.value);
+  const jifYear = parseYear(jifField.header) || parseYear(pickValue(normalized, [/^jcr year$/, /^jif year$/, /^year$/]));
+
+  return {
+    journalName: compactSpaces(journalName),
+    issn: extractIssnList(issnRaw),
+    edition: compactSpaces(edition).toUpperCase(),
+    category: compactSpaces(category),
+    quartile: parseQuartile(quartile),
+    impactFactor,
+    jifYear
+  };
+}
+
+function normalizeRow(row) {
+  const output = {};
+  Object.entries(row || {}).forEach(([key, value]) => {
+    output[normalizeKey(key)] = compactSpaces(value);
+  });
+  return output;
+}
+
+function pickValue(normalizedRow, patterns) {
+  const entries = Object.entries(normalizedRow || {});
+  for (const pattern of patterns) {
+    for (const [header, value] of entries) {
+      if (!value) continue;
+      if (pattern.test(header)) return value;
+    }
+  }
+  return "";
+}
+
+function pickJifField(normalizedRow) {
+  const entries = Object.entries(normalizedRow || {});
+  let selected = { header: "", value: "" };
+
+  for (const [header, value] of entries) {
+    if (!value) continue;
+    if (/quartile|jci/.test(header)) continue;
+
+    if (/(^|\s)(\d{4}\s*)?jif($|\s)|impact factor/.test(header)) {
+      selected = { header, value };
+      if (/\d{4}/.test(header)) return selected;
+    }
+  }
+
+  return selected;
+}
+
+function buildCatalog(parsedRows, sourceMeta) {
+  const byName = new Map();
+
+  parsedRows.forEach((row) => {
+    const key = normalizeKey(row.journalName);
+    if (!key) return;
+
+    if (!byName.has(key)) {
+      byName.set(key, {
+        journalName: row.journalName,
+        issnSet: new Set(),
+        editionsSet: new Set(),
+        metrics: []
+      });
+    }
+
+    const journal = byName.get(key);
+    row.issn.forEach((item) => journal.issnSet.add(item));
+    splitEditions(row.edition).forEach((item) => journal.editionsSet.add(item));
+
+    const metricKey = `${row.category}|${row.edition}|${row.quartile}|${row.jifYear}|${row.impactFactor}`;
+    if (!journal.metrics.some((item) => item._key === metricKey)) {
+      journal.metrics.push({
+        _key: metricKey,
+        category: row.category || null,
+        edition: row.edition || null,
+        quartile: row.quartile || null,
+        impactFactor: row.impactFactor ?? null,
+        jifYear: row.jifYear ?? null
+      });
+    }
+  });
+
+  const journals = [...byName.values()].map((item) => {
+    const editions = [...item.editionsSet].sort();
+
+    const metrics = item.metrics.map((metric) => ({
+      category: metric.category,
+      edition: metric.edition,
+      quartile: metric.quartile,
+      impactFactor: metric.impactFactor,
+      jifYear: metric.jifYear
+    }));
+
+    const bestQuartile = chooseBestQuartile(metrics.map((metric) => metric.quartile));
+    const bestAreas = uniq(
+      metrics
+        .filter((metric) => metric.quartile === bestQuartile && metric.category)
+        .map((metric) => metric.category)
+    );
+
+    const allQuartiles = uniq(metrics.map((metric) => metric.quartile).filter(Boolean)).sort(sortQuartiles);
+
+    const impactCandidates = metrics
+      .map((metric) => Number(metric.impactFactor))
+      .filter((value) => Number.isFinite(value));
+
+    const latestJifYear = Math.max(
+      ...metrics.map((metric) => (Number.isFinite(metric.jifYear) ? metric.jifYear : -Infinity))
+    );
+
+    return {
+      journalName: item.journalName,
+      issn: [...item.issnSet].sort(),
+      editions,
+      validatedInJcr: editions.includes("SCIE") || editions.includes("SSCI"),
+      impactFactor: impactCandidates.length ? Math.max(...impactCandidates) : null,
+      bestQuartile: bestQuartile || null,
+      bestQuartileAreas: bestAreas,
+      allQuartiles,
+      jifYear: Number.isFinite(latestJifYear) ? latestJifYear : null,
+      metrics
+    };
+  });
+
+  journals.sort((a, b) => a.journalName.localeCompare(b.journalName, "en", { sensitivity: "base" }));
+
+  const built = buildRuntimeCatalog(journals, {
+    sourceFileName: sourceMeta.sourceFileName,
+    sourceRows: sourceMeta.sourceRows,
+    parsedRows: parsedRows.length,
+    journalCount: journals.length,
+    uploadedAt: new Date().toISOString()
+  });
+
+  return built;
+}
+
+function buildRuntimeCatalog(journals, meta) {
+  const byName = new Map();
+  const byIssn = new Map();
+
+  journals.forEach((journal) => {
+    byName.set(normalizeKey(journal.journalName), journal);
+
+    (journal.issn || []).forEach((issn) => {
+      if (!byIssn.has(issn)) {
+        byIssn.set(issn, []);
+      }
+      byIssn.get(issn).push(journal);
+    });
+  });
+
+  return {
+    loaded: true,
+    meta,
+    journals,
+    byName,
+    byIssn
+  };
+}
+
+function normalizeOrcid(value) {
+  const text = String(value || "").trim();
+  const match = text.match(ORCID_REGEX);
+  if (!match) return "";
+  return match[0].toUpperCase();
+}
+
+async function fetchOrcidWorks(orcid) {
+  const url = `https://pub.orcid.org/v3.0/${orcid}/works`;
+  const response = await fetch(url, {
+    headers: {
+      Accept: "application/json"
+    }
+  });
+
+  if (!response.ok) {
+    throw new Error(`No fue posible consultar ORCID (${response.status}).`);
+  }
+
+  const payload = await response.json();
+  const groups = Array.isArray(payload.group) ? payload.group : [];
+  const works = [];
+  const seen = new Set();
+
+  groups.forEach((group) => {
+    const summaries = Array.isArray(group["work-summary"]) ? group["work-summary"] : [];
+
+    summaries.forEach((summary) => {
+      const putCode = summary["put-code"];
+      if (seen.has(putCode)) return;
+      seen.add(putCode);
+
+      works.push({
+        putCode,
+        title: summary?.title?.title?.value || "",
+        journalTitle: summary?.["journal-title"]?.value || "",
+        year: parseYear(summary?.["publication-date"]?.year?.value),
+        type: summary?.type || "",
+        doi: extractExternalId(summary, "doi"),
+        issnCandidates: extractIssnFromExternalIds(summary)
+      });
+    });
+  });
+
+  works.sort((a, b) => (b.year || 0) - (a.year || 0));
+  return works;
+}
+
+function extractExternalId(summary, targetType) {
+  const ids = summary?.["external-ids"]?.["external-id"];
+  if (!Array.isArray(ids)) return "";
+
+  const found = ids.find((item) => String(item?.["external-id-type"] || "").toLowerCase() === targetType);
+  return found?.["external-id-value"] || "";
+}
+
+function extractIssnFromExternalIds(summary) {
+  const ids = summary?.["external-ids"]?.["external-id"];
+  if (!Array.isArray(ids)) return [];
+
+  const out = [];
+  ids.forEach((item) => {
+    const type = String(item?.["external-id-type"] || "").toLowerCase();
+    if (!type.includes("issn")) return;
+    const value = String(item?.["external-id-value"] || "");
+    extractIssnList(value).forEach((issn) => out.push(issn));
+  });
+
+  return uniq(out);
+}
+
+function buildResearchReport(orcid, works, currentCatalog) {
+  const reportRows = [];
+  let matchedCatalogCount = 0;
+
+  works.forEach((work) => {
+    const journal = matchJournal(work, currentCatalog);
+    if (journal) {
+      matchedCatalogCount += 1;
+    }
+
+    if (!journal || !journal.validatedInJcr) {
+      return;
+    }
+
+    const editions = (journal.editions || []).filter((edition) => edition === "SCIE" || edition === "SSCI");
+    if (!editions.length) {
+      return;
+    }
+
+    reportRows.push({
+      title: work.title || "Sin titulo",
+      journal: work.journalTitle || journal.journalName,
+      year: work.year || null,
+      doi: work.doi || null,
+      type: work.type || null,
+      editions,
+      impactFactor: journal.impactFactor,
+      bestQuartile: journal.bestQuartile,
+      bestQuartileArea: (journal.bestQuartileAreas || []).join(" | ") || null,
+      allQuartiles: journal.allQuartiles || [],
+      issn: (journal.issn || []).join(", ")
+    });
+  });
+
+  const scieCount = reportRows.filter((row) => row.editions.includes("SCIE")).length;
+  const ssciCount = reportRows.filter((row) => row.editions.includes("SSCI")).length;
+
+  const quartileDistribution = { Q1: 0, Q2: 0, Q3: 0, Q4: 0, SinDato: 0 };
+  reportRows.forEach((row) => {
+    if (row.bestQuartile && quartileDistribution[row.bestQuartile] !== undefined) {
+      quartileDistribution[row.bestQuartile] += 1;
+    } else {
+      quartileDistribution.SinDato += 1;
+    }
+  });
+
+  const ifValues = reportRows
+    .map((row) => Number(row.impactFactor))
+    .filter((value) => Number.isFinite(value));
+
+  const topAreas = topCounts(
+    reportRows
+      .flatMap((row) => String(row.bestQuartileArea || "").split("|"))
+      .map((value) => compactSpaces(value))
+      .filter(Boolean),
+    10
+  );
+
+  return {
+    generatedAt: new Date().toISOString(),
+    researcher: { orcid },
+    catalogMeta: currentCatalog.meta,
+    stats: {
+      totalOrcidWorks: works.length,
+      worksWithJournalTitle: works.filter((work) => Boolean(work.journalTitle)).length,
+      worksMatchedInCatalog: matchedCatalogCount,
+      validatedWorksSCIEorSSCI: reportRows.length,
+      scieCount,
+      ssciCount,
+      validationRate: works.length ? Number(((reportRows.length / works.length) * 100).toFixed(2)) : 0,
+      averageImpactFactor: ifValues.length ? Number((sum(ifValues) / ifValues.length).toFixed(3)) : null,
+      maxImpactFactor: ifValues.length ? Math.max(...ifValues) : null,
+      quartileDistribution,
+      topBestQuartileAreas: topAreas
+    },
+    publications: reportRows
+  };
+}
+
+function matchJournal(work, currentCatalog) {
+  const candidates = [];
+  const seen = new Set();
+
+  (work.issnCandidates || []).forEach((issn) => {
+    const byIssn = currentCatalog.byIssn.get(issn) || [];
+    byIssn.forEach((journal) => {
+      const key = normalizeKey(journal.journalName);
+      if (seen.has(key)) return;
+      seen.add(key);
+      candidates.push(journal);
+    });
+  });
+
+  if (work.journalTitle) {
+    const byName = currentCatalog.byName.get(normalizeKey(work.journalTitle));
+    if (byName) {
+      const key = normalizeKey(byName.journalName);
+      if (!seen.has(key)) {
+        seen.add(key);
+        candidates.push(byName);
+      }
+    }
+  }
+
+  if (!candidates.length) {
+    return null;
+  }
+
+  return candidates.sort((a, b) => scoreJournalCandidate(b) - scoreJournalCandidate(a))[0];
+}
+
+function scoreJournalCandidate(journal) {
+  const validated = journal.validatedInJcr ? 100000 : 0;
+  const qScore = quartileScore(journal.bestQuartile);
+  const ifScore = Number.isFinite(Number(journal.impactFactor)) ? Number(journal.impactFactor) : 0;
+  return validated + qScore * 100 + ifScore;
+}
+
+function quartileScore(quartile) {
+  const map = { Q1: 4, Q2: 3, Q3: 2, Q4: 1 };
+  return map[String(quartile || "").toUpperCase()] || 0;
+}
+
+function parseImpactFactor(value) {
+  const text = compactSpaces(value).replace(",", ".");
+  if (!text) return null;
+
+  const match = text.match(/\d+(\.\d+)?/);
+  return match ? Number(match[0]) : null;
+}
+
+function parseQuartile(value) {
+  const match = String(value || "").toUpperCase().match(/\bQ[1-4]\b/);
+  return match ? match[0] : "";
+}
+
+function parseYear(value) {
+  const match = String(value || "").match(/\b(19|20)\d{2}\b/);
+  return match ? Number(match[0]) : null;
+}
+
+function splitEditions(value) {
+  return uniq(
+    String(value || "")
+      .split(/[;,/|]+/)
+      .map((item) => compactSpaces(item).toUpperCase())
+      .filter(Boolean)
+  );
+}
+
+function extractIssnList(value) {
+  const matches = String(value || "").toUpperCase().match(/[0-9]{4}-[0-9]{3}[0-9X]/g) || [];
+  return uniq(matches);
+}
+
+function chooseBestQuartile(values) {
+  const order = { Q1: 1, Q2: 2, Q3: 3, Q4: 4 };
+
+  const valid = values
+    .map((value) => String(value || "").toUpperCase())
+    .filter((value) => Object.prototype.hasOwnProperty.call(order, value));
+
+  if (!valid.length) return "";
+
+  return valid.sort((a, b) => order[a] - order[b])[0];
+}
+
+function sortQuartiles(a, b) {
+  const order = { Q1: 1, Q2: 2, Q3: 3, Q4: 4 };
+  const left = order[String(a || "").toUpperCase()] || 99;
+  const right = order[String(b || "").toUpperCase()] || 99;
+  return left - right;
+}
+
+function topCounts(values, limit) {
+  const counts = new Map();
+  values.forEach((value) => counts.set(value, (counts.get(value) || 0) + 1));
+
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit)
+    .map(([value, count]) => ({ value, count }));
+}
+
+function normalizeKey(value) {
+  return String(value || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function compactSpaces(value) {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function uniq(values) {
+  return [...new Set(values)];
+}
+
+function sum(values) {
+  return values.reduce((acc, value) => acc + value, 0);
+}
+
+function disableDuring(formElement, value) {
+  formElement.querySelectorAll("button, input").forEach((element) => {
+    element.disabled = value;
+  });
+}
+
+function setMessage(text, isError) {
+  message.textContent = text || "";
+  message.classList.toggle("error", Boolean(isError));
+}
+
+function csvEscape(value) {
+  const text = String(value ?? "");
+  if (!/[",\n]/.test(text)) return text;
+  return `"${text.replace(/"/g, '""')}"`;
+}
+
+function cell(value) {
+  const td = document.createElement("td");
+  td.textContent = String(value);
+  return td;
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}

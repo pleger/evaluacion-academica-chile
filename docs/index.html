@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ORCID + JCR (SCIE/SSCI)</title>
+    <link rel="stylesheet" href="./styles.css" />
+    <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js" defer></script>
+    <script src="./app.js" defer></script>
+  </head>
+  <body>
+    <main class="container">
+      <header class="hero">
+        <h1>Reporte ORCID validado con catalogo JCR/WoS</h1>
+        <p>
+          Carga una vez el catalogo de revistas y genera reportes de publicaciones validadas en SCIE/SSCI,
+          con Impact Factor, mejor cuartil y area.
+        </p>
+      </header>
+
+      <section class="card">
+        <h2>1) Catalogo de revistas WoS/JCR</h2>
+        <p id="catalog-status" class="status"></p>
+        <form id="catalog-form">
+          <div class="row">
+            <input id="catalog-file" type="file" accept=".csv,.txt,.xls,.xlsx" required />
+            <button type="submit">Cargar o reemplazar catalogo</button>
+          </div>
+        </form>
+        <div class="actions">
+          <button id="clear-catalog" type="button" class="secondary">Limpiar catalogo local</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>2) Investigador ORCID</h2>
+        <form id="researcher-form">
+          <div class="row">
+            <input
+              id="orcid-input"
+              type="text"
+              placeholder="0000-0003-0969-5139 o https://orcid.org/0000-0003-0969-5139"
+              required
+            />
+            <button type="submit" id="researcher-submit">Generar reporte</button>
+          </div>
+        </form>
+        <p id="message" class="message"></p>
+      </section>
+
+      <section id="summary-section" class="card hidden">
+        <h2>3) Resumen estadistico</h2>
+        <div id="summary-grid" class="summary-grid"></div>
+        <div class="actions">
+          <button id="download-csv" type="button">Exportar CSV</button>
+          <button id="download-json" type="button">Exportar JSON</button>
+        </div>
+      </section>
+
+      <section id="table-section" class="card hidden">
+        <h2>Publicaciones validadas en SCIE/SSCI</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Titulo</th>
+                <th>Revista</th>
+                <th>Ano</th>
+                <th>Indice</th>
+                <th>Impact Factor</th>
+                <th>Mejor Cuartil</th>
+                <th>Area del mejor cuartil</th>
+                <th>Todos los cuartiles</th>
+                <th>ISSN</th>
+                <th>DOI</th>
+              </tr>
+            </thead>
+            <tbody id="results-body"></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>

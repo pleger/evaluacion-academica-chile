@@ -1,0 +1,25 @@
+{
+  "name": "orcid-jcr-research-report",
+  "version": "1.0.0",
+  "description": "Aplicacion web para validar publicaciones ORCID contra catalogo JCR/WoS.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "keywords": [
+    "orcid",
+    "jcr",
+    "wos",
+    "scie",
+    "ssci"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "csv-parse": "^5.6.0",
+    "express": "^5.1.0",
+    "multer": "^2.0.2",
+    "xlsx": "^0.18.5"
+  }
+}
