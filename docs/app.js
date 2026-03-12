@@ -1132,9 +1132,11 @@ function buildResearchReport(orcid, works, currentCatalog) {
     }
   });
 
-  const scieCount = reportRows.filter((row) => row.editions.includes("SCIE")).length;
-  const ssciCount = reportRows.filter((row) => row.editions.includes("SSCI")).length;
-  const unspecifiedIndexCount = reportRows.filter((row) => row.editions.includes("JCR_UNSPECIFIED")).length;
+  const uniqueReportRows = dedupePublicationRows(reportRows);
+
+  const scieCount = uniqueReportRows.filter((row) => row.editions.includes("SCIE")).length;
+  const ssciCount = uniqueReportRows.filter((row) => row.editions.includes("SSCI")).length;
+  const unspecifiedIndexCount = uniqueReportRows.filter((row) => row.editions.includes("JCR_UNSPECIFIED")).length;
   const noCatalogMatchCount = diagnostics.filter((row) => row.reason === "NO_CATALOG_MATCH").length;
   const noJournalNameCount = diagnostics.filter((row) => row.reason === "NO_JOURNAL_NAME").length;
   const noQuartileCount = diagnostics.filter((row) => row.reason === "MATCHED_NO_QUARTILE").length;
@@ -1144,7 +1146,7 @@ function buildResearchReport(orcid, works, currentCatalog) {
   );
 
   const quartileDistribution = { Q1: 0, Q2: 0, Q3: 0, Q4: 0, SinDato: 0 };
-  reportRows.forEach((row) => {
+  uniqueReportRows.forEach((row) => {
     if (row.bestQuartile && quartileDistribution[row.bestQuartile] !== undefined) {
       quartileDistribution[row.bestQuartile] += 1;
     } else {
@@ -1152,12 +1154,12 @@ function buildResearchReport(orcid, works, currentCatalog) {
     }
   });
 
-  const ifValues = reportRows
+  const ifValues = uniqueReportRows
     .map((row) => Number(row.impactFactor))
     .filter((value) => Number.isFinite(value));
 
   const topAreas = topCounts(
-    reportRows
+    uniqueReportRows
       .flatMap((row) => String(row.bestQuartileArea || "").split("|"))
       .map((value) => compactSpaces(value))
       .filter(Boolean),
@@ -1172,7 +1174,7 @@ function buildResearchReport(orcid, works, currentCatalog) {
       totalOrcidWorks: works.length,
       worksWithJournalTitle: works.filter((work) => Boolean(work.journalTitle)).length,
       worksMatchedInCatalog: matchedCatalogCount,
-      validatedWorksSCIEorSSCI: reportRows.length,
+      validatedWorksSCIEorSSCI: uniqueReportRows.length,
       scieCount,
       ssciCount,
       unspecifiedIndexCount,
@@ -1180,15 +1182,55 @@ function buildResearchReport(orcid, works, currentCatalog) {
       noJournalNameCount,
       noQuartileCount,
       diagnosticsByReason,
-      validationRate: works.length ? Number(((reportRows.length / works.length) * 100).toFixed(2)) : 0,
+      validationRate: works.length ? Number(((uniqueReportRows.length / works.length) * 100).toFixed(2)) : 0,
       averageImpactFactor: ifValues.length ? Number((sum(ifValues) / ifValues.length).toFixed(3)) : null,
       maxImpactFactor: ifValues.length ? Math.max(...ifValues) : null,
       quartileDistribution,
       topBestQuartileAreas: topAreas
     },
-    publications: reportRows,
+    publications: uniqueReportRows,
     diagnostics
   };
+}
+
+function dedupePublicationRows(rows) {
+  const bestByKey = new Map();
+
+  rows.forEach((row) => {
+    const key = publicationUniqueKey(row);
+    if (!key) return;
+
+    if (!bestByKey.has(key)) {
+      bestByKey.set(key, row);
+      return;
+    }
+
+    const current = bestByKey.get(key);
+    const currentIf = Number(current.impactFactor) || 0;
+    const rowIf = Number(row.impactFactor) || 0;
+    if (rowIf > currentIf) {
+      bestByKey.set(key, row);
+    }
+  });
+
+  return [...bestByKey.values()].sort((a, b) => (Number(b.year) || 0) - (Number(a.year) || 0));
+}
+
+function publicationUniqueKey(row) {
+  const doi = normalizeDoi(row?.doi);
+  if (doi) return `doi:${doi}`;
+
+  const title = normalizeKey(row?.title);
+  const journal = normalizeKey(row?.journal);
+  const year = String(row?.year || "");
+  if (!title && !journal && !year) return "";
+  return `fallback:${title}|${journal}|${year}`;
+}
+
+function normalizeDoi(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (!raw) return "";
+  return raw.replace(/^https?:\/\/(dx\.)?doi\.org\//, "").trim();
 }
 
 function matchJournalDetails(work, currentCatalog) {
