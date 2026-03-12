@@ -331,7 +331,7 @@ function renderTable(publications) {
   if (!publications.length) {
     const tr = document.createElement("tr");
     const td = document.createElement("td");
-    td.colSpan = 10;
+    td.colSpan = 11;
     td.textContent = "No se encontraron publicaciones validadas en SCIE/SSCI.";
     tr.appendChild(td);
     resultsBody.appendChild(tr);
@@ -339,8 +339,9 @@ function renderTable(publications) {
   }
 
   const fragment = document.createDocumentFragment();
-  publications.forEach((item) => {
+  publications.forEach((item, index) => {
     const tr = document.createElement("tr");
+    tr.appendChild(cell(index + 1));
     tr.appendChild(cell(item.title));
     tr.appendChild(cell(item.journal));
     tr.appendChild(cell(item.year || "-"));
@@ -363,7 +364,7 @@ function renderDiagnostics(rows) {
   if (!rows.length) {
     const tr = document.createElement("tr");
     const td = document.createElement("td");
-    td.colSpan = 11;
+    td.colSpan = 12;
     td.textContent = "No hay diagnostico disponible.";
     tr.appendChild(td);
     diagnosticsBody.appendChild(tr);
@@ -371,8 +372,9 @@ function renderDiagnostics(rows) {
   }
 
   const fragment = document.createDocumentFragment();
-  rows.forEach((item) => {
+  rows.forEach((item, index) => {
     const tr = document.createElement("tr");
+    tr.appendChild(cell(index + 1));
     tr.appendChild(cell(item.statusLabel || "-"));
     tr.appendChild(cell(item.reasonLabel || "-"));
     tr.appendChild(cell(item.year || "-"));
@@ -403,6 +405,7 @@ function onDownloadCsv() {
   if (!lastReport) return;
 
   const header = [
+    "N",
     "ORCID",
     "Titulo",
     "Revista",
@@ -418,9 +421,10 @@ function onDownloadCsv() {
   ];
 
   const lines = [header.map(csvEscape).join(",")];
-  lastReport.publications.forEach((row) => {
+  lastReport.publications.forEach((row, index) => {
     lines.push(
       [
+        index + 1,
         lastReport.researcher.orcid,
         row.title,
         row.journal,
@@ -456,6 +460,7 @@ function onDownloadDiagnosticsCsv() {
   if (!lastReport) return;
 
   const header = [
+    "N",
     "ORCID",
     "PutCode",
     "Estado",
@@ -472,9 +477,10 @@ function onDownloadDiagnosticsCsv() {
   ];
 
   const lines = [header.map(csvEscape).join(",")];
-  (lastReport.diagnostics || []).forEach((row) => {
+  (lastReport.diagnostics || []).forEach((row, index) => {
     lines.push(
       [
+        index + 1,
         lastReport.researcher?.orcid || "",
         row.putCode || "",
         row.statusLabel || "",
