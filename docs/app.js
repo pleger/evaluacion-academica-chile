@@ -277,7 +277,6 @@ async function onGenerateReport(event) {
     lastReport = report;
     renderSummary(report);
     renderTable(report.publications);
-    renderDiagnostics(report.diagnostics || []);
     setMessage("Reporte generado.", false);
   } catch (error) {
     setMessage(error.message || "No fue posible generar el reporte.", true);
@@ -299,9 +298,6 @@ function renderSummary(report) {
     ["SCIE", stats.scieCount ?? 0],
     ["SSCI", stats.ssciCount ?? 0],
     ["Indice no especificado", stats.unspecifiedIndexCount ?? 0],
-    ["Sin match catalogo", stats.noCatalogMatchCount ?? 0],
-    ["Sin nombre revista ORCID", stats.noJournalNameCount ?? 0],
-    ["Sin cuartil en catalogo", stats.noQuartileCount ?? 0],
     ["Tasa validacion", `${stats.validationRate ?? 0}%`],
     ["IF promedio", stats.averageImpactFactor ?? "-"],
     ["IF maximo", stats.maxImpactFactor ?? "-"],
@@ -312,10 +308,6 @@ function renderSummary(report) {
     [
       "Top areas",
       (stats.topBestQuartileAreas || []).map((item) => `${item.value} (${item.count})`).join(" | ") || "-"
-    ],
-    [
-      "Top motivo descarte",
-      (stats.diagnosticsByReason || []).map((item) => `${item.value} (${item.count})`).join(" | ") || "-"
     ]
   ];
 
