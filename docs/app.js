@@ -296,7 +296,8 @@ function renderSummary(report) {
     ["SSCI", stats.ssciCount ?? 0],
     ["Indice no especificado", stats.unspecifiedIndexCount ?? 0],
     ["Sin match catalogo", stats.noCatalogMatchCount ?? 0],
-    ["Sin revista/ISSN ORCID", stats.noJournalDataCount ?? 0],
+    ["Sin nombre revista ORCID", stats.noJournalNameCount ?? 0],
+    ["Sin cuartil en catalogo", stats.noQuartileCount ?? 0],
     ["Tasa validacion", `${stats.validationRate ?? 0}%`],
     ["IF promedio", stats.averageImpactFactor ?? "-"],
     ["IF maximo", stats.maxImpactFactor ?? "-"],
@@ -362,7 +363,7 @@ function renderDiagnostics(rows) {
   if (!rows.length) {
     const tr = document.createElement("tr");
     const td = document.createElement("td");
-    td.colSpan = 10;
+    td.colSpan = 11;
     td.textContent = "No hay diagnostico disponible.";
     tr.appendChild(td);
     diagnosticsBody.appendChild(tr);
@@ -379,6 +380,7 @@ function renderDiagnostics(rows) {
     tr.appendChild(cell(item.orcidJournal || "-"));
     tr.appendChild(cell(item.catalogJournal || "-"));
     tr.appendChild(cell(item.matchBy || "-"));
+    tr.appendChild(cell(item.matchScore ?? "-"));
     tr.appendChild(cell((item.editionLabels || []).join(", ") || "-"));
     tr.appendChild(cell((item.orcidIssnCandidates || []).join(", ") || "-"));
     tr.appendChild(cell(item.doi || "-"));
@@ -463,6 +465,7 @@ function onDownloadDiagnosticsCsv() {
     "RevistaORCID",
     "RevistaCatalogo",
     "MatchPor",
+    "ScoreMatch",
     "Indice",
     "ISSNORCID",
     "DOI"
@@ -481,6 +484,7 @@ function onDownloadDiagnosticsCsv() {
         row.orcidJournal || "",
         row.catalogJournal || "",
         row.matchBy || "",
+        row.matchScore ?? "",
         (row.editionLabels || []).join("|"),
         (row.orcidIssnCandidates || []).join("|"),
         row.doi || ""
@@ -958,7 +962,7 @@ function buildRuntimeCatalog(journals, meta) {
   journals.forEach((journal) => {
     const key = normalizeKey(journal.journalName);
     byName.set(key, journal);
-    nameEntries.push({ key, journal });
+    nameEntries.push({ key, tokens: tokenizeKey(key), journal });
 
     (journal.issn || []).forEach((issn) => {
       if (!byIssn.has(issn)) {
@@ -1063,13 +1067,17 @@ function buildResearchReport(orcid, works, currentCatalog) {
 
     const editions = journal ? (journal.editions || []).filter((edition) => isValidatedEdition(edition)) : [];
     const editionLabels = editions.map((edition) => formatEditionLabel(edition));
+    const hasQuartile =
+      Boolean(journal?.bestQuartile) || (Array.isArray(journal?.allQuartiles) && journal.allQuartiles.length > 0);
 
     let status = "EXCLUIDA";
     let reason = "NO_CATALOG_MATCH";
-    if (!work.journalTitle && !(work.issnCandidates || []).length) {
-      reason = "NO_JOURNAL_DATA";
+    if (!work.journalTitle) {
+      reason = "NO_JOURNAL_NAME";
     } else if (journal && !journal.validatedInJcr) {
       reason = "MATCHED_NOT_VALIDATED";
+    } else if (journal && !hasQuartile) {
+      reason = "MATCHED_NO_QUARTILE";
     } else if (journal && !editions.length) {
       reason = "MATCHED_NO_ALLOWED_INDEX";
     } else if (journal && editions.length) {
@@ -1090,6 +1098,7 @@ function buildResearchReport(orcid, works, currentCatalog) {
       orcidIssnCandidates: work.issnCandidates || [],
       catalogJournal: journal?.journalName || "",
       matchBy: match.matchByLabel || "",
+      matchScore: Number.isFinite(match.matchScore) ? Number(match.matchScore.toFixed(3)) : null,
       editions,
       editionLabels
     });
@@ -1118,7 +1127,8 @@ function buildResearchReport(orcid, works, currentCatalog) {
   const ssciCount = reportRows.filter((row) => row.editions.includes("SSCI")).length;
   const unspecifiedIndexCount = reportRows.filter((row) => row.editions.includes("JCR_UNSPECIFIED")).length;
   const noCatalogMatchCount = diagnostics.filter((row) => row.reason === "NO_CATALOG_MATCH").length;
-  const noJournalDataCount = diagnostics.filter((row) => row.reason === "NO_JOURNAL_DATA").length;
+  const noJournalNameCount = diagnostics.filter((row) => row.reason === "NO_JOURNAL_NAME").length;
+  const noQuartileCount = diagnostics.filter((row) => row.reason === "MATCHED_NO_QUARTILE").length;
   const diagnosticsByReason = topCounts(
     diagnostics.map((row) => row.reasonLabel).filter(Boolean),
     20
@@ -1158,7 +1168,8 @@ function buildResearchReport(orcid, works, currentCatalog) {
       ssciCount,
       unspecifiedIndexCount,
       noCatalogMatchCount,
-      noJournalDataCount,
+      noJournalNameCount,
+      noQuartileCount,
       diagnosticsByReason,
       validationRate: works.length ? Number(((reportRows.length / works.length) * 100).toFixed(2)) : 0,
       averageImpactFactor: ifValues.length ? Number((sum(ifValues) / ifValues.length).toFixed(3)) : null,
@@ -1172,106 +1183,91 @@ function buildResearchReport(orcid, works, currentCatalog) {
 }
 
 function matchJournalDetails(work, currentCatalog) {
-  const candidatesByKey = new Map();
   const workJournalKey = normalizeKey(work.journalTitle);
-
-  const addCandidate = (journal, method) => {
-    if (!journal) return;
-    const key = normalizeKey(journal.journalName);
-    if (!key) return;
-    if (!candidatesByKey.has(key)) {
-      candidatesByKey.set(key, {
-        journal,
-        methods: new Set()
-      });
-    }
-    candidatesByKey.get(key).methods.add(method);
-  };
-
-  (work.issnCandidates || []).forEach((issn) => {
-    const byIssn = currentCatalog.byIssn.get(issn) || [];
-    byIssn.forEach((journal) => {
-      addCandidate(journal, "issn_exact");
-    });
-  });
-
-  if (work.journalTitle) {
-    const byName = currentCatalog.byName.get(workJournalKey);
-    if (byName) {
-      addCandidate(byName, "name_exact");
-    }
+  if (!workJournalKey) {
+    return {
+      journal: null,
+      matchBy: "",
+      matchByLabel: "",
+      matchScore: null,
+      candidateCount: 0
+    };
   }
 
-  if (!candidatesByKey.size && workJournalKey) {
-    const fuzzy = findFuzzyJournalMatches(workJournalKey, currentCatalog);
-    fuzzy.forEach((journal) => {
-      addCandidate(journal, "name_fuzzy");
-    });
-  }
-
-  const candidates = [...candidatesByKey.values()];
+  const candidates = findApproximateJournalMatches(workJournalKey, currentCatalog);
   if (!candidates.length) {
     return {
       journal: null,
       matchBy: "",
       matchByLabel: "",
+      matchScore: null,
       candidateCount: 0
     };
   }
 
   const ranked = candidates
-    .map((candidate) => {
-      const bestMethod = getBestMethod(candidate.methods);
-      const methodBonus = bestMethod === "issn_exact" ? 1000 : bestMethod === "name_exact" ? 300 : 0;
-      return {
-        ...candidate,
-        bestMethod,
-        score: scoreJournalCandidate(candidate.journal, workJournalKey) + methodBonus
-      };
-    })
+    .map((candidate) => ({
+      ...candidate,
+      score: scoreJournalCandidate(candidate.journal, workJournalKey) + candidate.similarity * 1000
+    }))
     .sort((left, right) => right.score - left.score);
 
   const best = ranked[0];
   return {
     journal: best.journal,
-    matchBy: best.bestMethod,
-    matchByLabel: matchByToLabel(best.bestMethod),
+    matchBy: "name_approx",
+    matchByLabel: matchByToLabel("name_approx"),
+    matchScore: best.similarity,
     candidateCount: candidates.length
   };
 }
 
-function getBestMethod(methodSet) {
-  if (methodSet.has("issn_exact")) return "issn_exact";
-  if (methodSet.has("name_exact")) return "name_exact";
-  if (methodSet.has("name_fuzzy")) return "name_fuzzy";
-  return "";
-}
-
 function matchByToLabel(matchBy) {
-  if (matchBy === "issn_exact") return "ISSN exacto";
-  if (matchBy === "name_exact") return "Nombre exacto";
-  if (matchBy === "name_fuzzy") return "Nombre aproximado";
+  if (matchBy === "name_approx") return "Nombre aproximado";
   return "";
 }
 
 function reasonToLabel(reason) {
   if (reason === "VALIDATED_INCLUDED") return "Incluida: validada en catalogo";
   if (reason === "NO_CATALOG_MATCH") return "Excluida: sin coincidencia en catalogo";
-  if (reason === "NO_JOURNAL_DATA") return "Excluida: ORCID sin revista ni ISSN";
+  if (reason === "NO_JOURNAL_NAME") return "Excluida: ORCID sin nombre de revista";
   if (reason === "MATCHED_NOT_VALIDATED") return "Excluida: revista no validada";
+  if (reason === "MATCHED_NO_QUARTILE") return "Excluida: revista sin cuartil";
   if (reason === "MATCHED_NO_ALLOWED_INDEX") return "Excluida: indice no permitido";
   return reason || "Sin detalle";
 }
 
-function findFuzzyJournalMatches(workJournalKey, currentCatalog) {
+function findApproximateJournalMatches(workJournalKey, currentCatalog) {
   const out = [];
+  const workTokens = tokenizeKey(workJournalKey);
+  if (!workTokens.length) return out;
+
   (currentCatalog.nameEntries || []).forEach((entry) => {
-    if (!entry?.key || !entry?.journal) return;
-    if (entry.key.includes(workJournalKey) || workJournalKey.includes(entry.key)) {
-      out.push(entry.journal);
-    }
+    if (!entry?.key || !entry?.tokens?.length || !entry?.journal) return;
+    const similarity = computeApproxSimilarity(workJournalKey, workTokens, entry.key, entry.tokens);
+    if (similarity < 0.6) return;
+    out.push({ journal: entry.journal, similarity });
   });
-  return out.slice(0, 40);
+
+  return out
+    .sort((left, right) => right.similarity - left.similarity)
+    .slice(0, 40);
+}
+
+function computeApproxSimilarity(workKey, workTokens, candidateKey, candidateTokens) {
+  const workSet = new Set(workTokens);
+  const candidateSet = new Set(candidateTokens);
+  let intersection = 0;
+
+  workSet.forEach((token) => {
+    if (candidateSet.has(token)) intersection += 1;
+  });
+
+  const unionSize = new Set([...workSet, ...candidateSet]).size || 1;
+  const jaccard = intersection / unionSize;
+  const containment = intersection / (workSet.size || 1);
+  const substringBoost = candidateKey.includes(workKey) || workKey.includes(candidateKey) ? 0.2 : 0;
+  return Math.min(1, jaccard * 0.65 + containment * 0.35 + substringBoost);
 }
 
 function scoreJournalCandidate(journal, workJournalKey = "") {
@@ -1370,6 +1366,13 @@ function normalizeKey(value) {
     .replace(/[\u0300-\u036f]/g, "")
     .replace(/[^a-z0-9]+/g, " ")
     .trim();
+}
+
+function tokenizeKey(value) {
+  return normalizeKey(value)
+    .split(" ")
+    .map((token) => token.trim())
+    .filter((token) => token.length > 1);
 }
 
 function compactSpaces(value) {
