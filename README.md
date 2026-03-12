@@ -11,8 +11,9 @@ Aplicacion web para:
    - Area(s) del mejor cuartil
    - Todos los cuartiles
 5. Exportar reporte a CSV y JSON.
-6. Mostrar resumen estadistico del investigador.
-7. Mostrar diagnostico por publicacion (incluida/excluida) con motivo de coincidencia.
+6. Exportar tabla de publicaciones validadas en CSV y Excel (.xlsx).
+7. Mostrar resumen estadistico del investigador.
+8. Mostrar diagnostico por publicacion (incluida/excluida) con motivo de coincidencia.
 
 ## Estructura
 

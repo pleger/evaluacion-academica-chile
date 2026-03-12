@@ -23,6 +23,8 @@ const summarySection = document.getElementById("summary-section");
 const summaryGrid = document.getElementById("summary-grid");
 const tableSection = document.getElementById("table-section");
 const resultsBody = document.getElementById("results-body");
+const downloadPublicationsCsvButton = document.getElementById("download-publications-csv");
+const downloadPublicationsXlsxButton = document.getElementById("download-publications-xlsx");
 const diagnosticsSection = document.getElementById("diagnostics-section");
 const diagnosticsBody = document.getElementById("diagnostics-body");
 const downloadCsvButton = document.getElementById("download-csv");
@@ -37,6 +39,8 @@ clearCatalogButton.addEventListener("click", onClearCatalog);
 researcherForm.addEventListener("submit", onGenerateReport);
 downloadCsvButton.addEventListener("click", onDownloadCsv);
 downloadJsonButton.addEventListener("click", onDownloadJson);
+downloadPublicationsCsvButton.addEventListener("click", onDownloadPublicationsCsv);
+downloadPublicationsXlsxButton.addEventListener("click", onDownloadPublicationsXlsx);
 downloadDiagnosticsCsvButton.addEventListener("click", onDownloadDiagnosticsCsv);
 
 init();
@@ -404,48 +408,37 @@ function clearReport() {
 function onDownloadCsv() {
   if (!lastReport) return;
 
-  const header = [
-    "N",
-    "ORCID",
-    "Titulo",
-    "Revista",
-    "Ano",
-    "DOI",
-    "Tipo",
-    "Indice",
-    "ImpactFactor",
-    "MejorQuartil",
-    "AreaMejorQuartil",
-    "TodosQuartiles",
-    "ISSN"
-  ];
-
+  const header = Object.keys(buildPublicationExportRow({}, 1, lastReport.researcher.orcid));
   const lines = [header.map(csvEscape).join(",")];
   lastReport.publications.forEach((row, index) => {
-    lines.push(
-      [
-        index + 1,
-        lastReport.researcher.orcid,
-        row.title,
-        row.journal,
-        row.year || "",
-        row.doi || "",
-        row.type || "",
-        (row.editionLabels || row.editions || []).join("|"),
-        row.impactFactor ?? "",
-        row.bestQuartile || "",
-        row.bestQuartileArea || "",
-        row.allQuartiles.join("|"),
-        row.issn || ""
-      ]
-        .map(csvEscape)
-        .join(",")
-    );
+    const values = Object.values(buildPublicationExportRow(row, index + 1, lastReport.researcher.orcid));
+    lines.push(values.map(csvEscape).join(","));
   });
 
   const csvContent = `\uFEFF${lines.join("\n")}`;
   const fileName = `reporte_orcid_${lastReport.researcher.orcid.replace(/-/g, "")}.csv`;
   downloadBlob(csvContent, "text/csv;charset=utf-8", fileName);
+}
+
+function onDownloadPublicationsCsv() {
+  onDownloadCsv();
+}
+
+function onDownloadPublicationsXlsx() {
+  if (!lastReport) return;
+  if (typeof XLSX === "undefined") {
+    setMessage("No se pudo cargar el exportador Excel.", true);
+    return;
+  }
+
+  const rows = lastReport.publications.map((row, index) =>
+    buildPublicationExportRow(row, index + 1, lastReport.researcher?.orcid || "")
+  );
+  const worksheet = XLSX.utils.json_to_sheet(rows);
+  const workbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(workbook, worksheet, "Publicaciones");
+  const fileName = `publicaciones_orcid_${(lastReport.researcher?.orcid || "investigador").replace(/-/g, "")}.xlsx`;
+  XLSX.writeFile(workbook, fileName);
 }
 
 function onDownloadJson() {
@@ -503,6 +496,24 @@ function onDownloadDiagnosticsCsv() {
   const csvContent = `\uFEFF${lines.join("\n")}`;
   const fileName = `diagnostico_orcid_${lastReport.researcher.orcid.replace(/-/g, "")}.csv`;
   downloadBlob(csvContent, "text/csv;charset=utf-8", fileName);
+}
+
+function buildPublicationExportRow(row, index, orcid) {
+  return {
+    N: index,
+    ORCID: orcid || "",
+    Titulo: row.title || "",
+    Revista: row.journal || "",
+    Ano: row.year || "",
+    DOI: row.doi || "",
+    Tipo: row.type || "",
+    Indice: (row.editionLabels || row.editions || []).join("|"),
+    ImpactFactor: row.impactFactor ?? "",
+    MejorQuartil: row.bestQuartile || "",
+    AreaMejorQuartil: row.bestQuartileArea || "",
+    TodosQuartiles: (row.allQuartiles || []).join("|"),
+    ISSN: row.issn || ""
+  };
 }
 
 function downloadBlob(content, mimeType, fileName) {
